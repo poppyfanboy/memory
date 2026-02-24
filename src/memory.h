@@ -15,11 +15,6 @@ void heap_allocator_destroy(HeapAllocator *allocator);
 void *heap_allocate(HeapAllocator *allocator, ptrdiff_t size);
 void heap_deallocate(HeapAllocator *allocator, void *memory);
 
-void *heap_reallocate(
-    HeapAllocator *allocator,
-    void *memory,
-    ptrdiff_t old_size,
-    ptrdiff_t new_size
-);
+void *heap_reallocate(HeapAllocator *allocator, void *memory, ptrdiff_t new_size);
 
 #endif

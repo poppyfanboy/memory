@@ -8,6 +8,7 @@ typedef ptrdiff_t isize;
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+// It is assumed that this function returns 16-byte aligned addresses.
 void *system_allocate(isize size) {
     HANDLE heap = GetProcessHeap();
     return HeapAlloc(heap, 0, size);
@@ -66,6 +67,26 @@ void memory_move(void const *source, isize size, void *dest) {
     }
 }
 
+isize const BLOCK_HEADER_SIZE = 16;
+
+typedef void Block;
+
+typedef struct {
+    isize size;
+} BlockHeader;
+
+static inline BlockHeader *block_header(Block *block) {
+    return block;
+}
+
+static inline void *block_memory(Block *block) {
+    return (u8 *)block + BLOCK_HEADER_SIZE;
+}
+
+static inline Block *memory_to_block(void *memory) {
+    return (u8 *)memory - BLOCK_HEADER_SIZE;
+}
+
 struct HeapAllocator {
     void *dummy_data;
 };
@@ -89,7 +110,14 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         return NULL;
     }
 
-    return system_allocate(size);
+    Block *block = system_allocate(size + BLOCK_HEADER_SIZE);
+    if (block == NULL) {
+        return NULL;
+    }
+
+    block_header(block)->size = size;
+
+    return block_memory(block);
 }
 
 void heap_deallocate(HeapAllocator *allocator, void *memory) {
@@ -97,10 +125,11 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
         return;
     }
 
-    system_deallocate(memory);
+    Block *block = memory_to_block(memory);
+    system_deallocate(block);
 }
 
-void *heap_reallocate(HeapAllocator *allocator, void *memory, isize old_size, isize new_size) {
+void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     if (new_size == 0) {
         heap_deallocate(allocator, memory);
         return NULL;
@@ -112,7 +141,9 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize old_size, is
     }
 
     if (memory != NULL) {
-        memory_copy(memory, old_size, new_memory);
+        Block *block = memory_to_block(memory);
+        memory_copy(memory, block_header(block)->size, new_memory);
+
         heap_deallocate(allocator, memory);
     }
 
