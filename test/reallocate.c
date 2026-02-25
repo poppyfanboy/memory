@@ -2,6 +2,8 @@
 
 #include "../src/memory.h"
 
+#define COUNT 10000
+
 typedef struct {
     int *values;
     int count;
@@ -31,13 +33,21 @@ int main(void) {
     assert(allocator != NULL);
 
     Array array = {0};
-    for (int i = 0; i < 1000; i += 1) {
+    for (int i = 0; i < COUNT; i += 1) {
         array_push(&array, i, allocator);
     }
 
     for (int i = 0; i < array.count; i += 1) {
         assert(array.values[i] == i);
     }
+
+    array.values = heap_reallocate(allocator, array.values, 1 * sizeof(*array.values));
+    array.capacity = 1;
+    array.count = 1;
+    assert(array.values[0] == 0);
+
+    array.values = heap_reallocate(allocator, array.values, 0);
+    assert(array.values == NULL);
 
     heap_allocator_destroy(allocator);
     return 0;

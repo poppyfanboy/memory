@@ -1,22 +1,28 @@
 #include "memory.h"
 
 typedef unsigned char u8;
+typedef size_t usize;
 typedef ptrdiff_t isize;
+
+#define ALIGNMENT 16
+#define ALIGN_UP(x) ((usize)(x + ALIGNMENT - 1) & (~(usize)ALIGNMENT + 1))
+
+static inline isize isize_min(isize left, isize right) {
+    return left < right ? left : right;
+}
 
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-// It is assumed that this function returns 16-byte aligned addresses.
+// It is assumed that this function returns addresses aligned to "ALIGNMENT" bytes.
 void *system_allocate(isize size) {
-    HANDLE heap = GetProcessHeap();
-    return HeapAlloc(heap, 0, size);
+    return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
 void system_deallocate(void *memory) {
-    HANDLE heap = GetProcessHeap();
-    HeapFree(heap, 0, memory);
+    VirtualFree(memory, 0, MEM_RELEASE);
 }
 
 #endif // _WIN32
@@ -67,28 +73,26 @@ void memory_move(void const *source, isize size, void *dest) {
     }
 }
 
-isize const BLOCK_HEADER_SIZE = 16;
+#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block))
 
-typedef void Block;
+typedef struct Block Block;
 
-typedef struct {
+struct Block {
     isize size;
-} BlockHeader;
-
-static inline BlockHeader *block_header(Block *block) {
-    return block;
-}
+    Block *previous;
+    Block *next;
+};
 
 static inline void *block_memory(Block *block) {
     return (u8 *)block + BLOCK_HEADER_SIZE;
 }
 
 static inline Block *memory_to_block(void *memory) {
-    return (u8 *)memory - BLOCK_HEADER_SIZE;
+    return (Block *)((u8 *)memory - BLOCK_HEADER_SIZE);
 }
 
 struct HeapAllocator {
-    void *dummy_data;
+    Block *blocks;
 };
 
 HeapAllocator *heap_allocator_create(void) {
@@ -97,27 +101,45 @@ HeapAllocator *heap_allocator_create(void) {
         return NULL;
     }
 
-    allocator->dummy_data = NULL;
+    allocator->blocks = NULL;
+
     return allocator;
 }
 
 void heap_allocator_destroy(HeapAllocator *allocator) {
+    Block *block_iter = allocator->blocks;
+    while (block_iter != NULL) {
+        Block *block = block_iter;
+        block_iter = block_iter->next;
+
+        system_deallocate(block);
+    }
+
     system_deallocate(allocator);
 }
 
 void *heap_allocate(HeapAllocator *allocator, isize size) {
+    size = ALIGN_UP(size);
     if (size == 0) {
         return NULL;
     }
 
-    Block *block = system_allocate(size + BLOCK_HEADER_SIZE);
-    if (block == NULL) {
+    Block *new_block = system_allocate(size + BLOCK_HEADER_SIZE);
+    if (new_block == NULL) {
         return NULL;
     }
 
-    block_header(block)->size = size;
+    new_block->size = size;
 
-    return block_memory(block);
+    new_block->previous = NULL;
+    new_block->next = allocator->blocks;
+
+    if (allocator->blocks != NULL) {
+        (allocator->blocks)->previous = new_block;
+    }
+    allocator->blocks = new_block;
+
+    return block_memory(new_block);
 }
 
 void heap_deallocate(HeapAllocator *allocator, void *memory) {
@@ -126,10 +148,23 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
 
     Block *block = memory_to_block(memory);
+
+    if (allocator->blocks == block) {
+        allocator->blocks = (allocator->blocks)->next;
+    }
+
+    if (block->previous != NULL) {
+        (block->previous)->next = block->next;
+    }
+    if (block->next != NULL) {
+        (block->next)->previous = block->previous;
+    }
+
     system_deallocate(block);
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
+    new_size = ALIGN_UP(new_size);
     if (new_size == 0) {
         heap_deallocate(allocator, memory);
         return NULL;
@@ -142,7 +177,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
     if (memory != NULL) {
         Block *block = memory_to_block(memory);
-        memory_copy(memory, block_header(block)->size, new_memory);
+        memory_copy(memory, isize_min(block->size, new_size), new_memory);
 
         heap_deallocate(allocator, memory);
     }
