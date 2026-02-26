@@ -17,4 +17,11 @@ void heap_deallocate(HeapAllocator *allocator, void *memory);
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, ptrdiff_t new_size);
 
+typedef struct {
+    void *block_memory;
+    ptrdiff_t block_size;
+} HeapIterator;
+
+void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator);
+
 #endif

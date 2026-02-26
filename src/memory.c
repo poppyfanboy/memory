@@ -184,3 +184,20 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
     return new_memory;
 }
+
+void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator) {
+    Block *current_block;
+    if (iterator->block_memory == NULL) {
+        current_block = allocator->blocks;
+    } else {
+        current_block = memory_to_block(iterator->block_memory)->next;
+    }
+
+    if (current_block == NULL) {
+        iterator->block_memory = NULL;
+        iterator->block_size = 0;
+    } else {
+        iterator->block_memory = block_memory(current_block);
+        iterator->block_size = current_block->size;
+    }
+}
