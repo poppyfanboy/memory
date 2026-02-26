@@ -91,8 +91,56 @@ static inline Block *memory_to_block(void *memory) {
     return (Block *)((u8 *)memory - BLOCK_HEADER_SIZE);
 }
 
+typedef Block *BlockList;
+
+static inline void block_list_prepend(BlockList *list, Block *block) {
+    block->previous = NULL;
+    block->next = *list;
+
+    if (*list != NULL) {
+        (*list)->previous = block;
+    }
+    *list = block;
+}
+
+static inline void block_list_insert_sorted(BlockList *list, Block *block) {
+    Block *previous_block = NULL;
+    Block *next_block = *list;
+    while (next_block != NULL && block->size > next_block->size) {
+        previous_block = next_block;
+        next_block = next_block->next;
+    }
+
+    if (previous_block == NULL) {
+        *list = block;
+    }
+    block->previous = previous_block;
+    block->next = next_block;
+
+    if (previous_block != NULL) {
+        previous_block->next = block;
+    }
+    if (next_block != NULL) {
+        next_block->previous = block;
+    }
+}
+
+static inline void block_list_remove(BlockList *list, Block *block) {
+    if (*list == block) {
+        *list = (*list)->next;
+    }
+
+    if (block->previous != NULL) {
+        (block->previous)->next = block->next;
+    }
+    if (block->next != NULL) {
+        (block->next)->previous = block->previous;
+    }
+}
+
 struct HeapAllocator {
-    Block *blocks;
+    BlockList free_blocks;
+    BlockList allocated_blocks;
 };
 
 HeapAllocator *heap_allocator_create(void) {
@@ -101,13 +149,24 @@ HeapAllocator *heap_allocator_create(void) {
         return NULL;
     }
 
-    allocator->blocks = NULL;
+    allocator->free_blocks = NULL;
+    allocator->allocated_blocks = NULL;
 
     return allocator;
 }
 
 void heap_allocator_destroy(HeapAllocator *allocator) {
-    Block *block_iter = allocator->blocks;
+    Block *block_iter = NULL;
+
+    block_iter = allocator->free_blocks;
+    while (block_iter != NULL) {
+        Block *block = block_iter;
+        block_iter = block_iter->next;
+
+        system_deallocate(block);
+    }
+
+    block_iter = allocator->allocated_blocks;
     while (block_iter != NULL) {
         Block *block = block_iter;
         block_iter = block_iter->next;
@@ -124,20 +183,23 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         return NULL;
     }
 
+    Block *free_block = allocator->free_blocks;
+    while (free_block != NULL && free_block->size < size) {
+        free_block = free_block->next;
+    }
+    if (free_block != NULL) {
+        block_list_remove(&allocator->free_blocks, free_block);
+        block_list_prepend(&allocator->allocated_blocks, free_block);
+        return block_memory(free_block);
+    }
+
     Block *new_block = system_allocate(size + BLOCK_HEADER_SIZE);
     if (new_block == NULL) {
         return NULL;
     }
 
     new_block->size = size;
-
-    new_block->previous = NULL;
-    new_block->next = allocator->blocks;
-
-    if (allocator->blocks != NULL) {
-        (allocator->blocks)->previous = new_block;
-    }
-    allocator->blocks = new_block;
+    block_list_prepend(&allocator->allocated_blocks, new_block);
 
     return block_memory(new_block);
 }
@@ -148,19 +210,8 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
 
     Block *block = memory_to_block(memory);
-
-    if (allocator->blocks == block) {
-        allocator->blocks = (allocator->blocks)->next;
-    }
-
-    if (block->previous != NULL) {
-        (block->previous)->next = block->next;
-    }
-    if (block->next != NULL) {
-        (block->next)->previous = block->previous;
-    }
-
-    system_deallocate(block);
+    block_list_remove(&allocator->allocated_blocks, block);
+    block_list_insert_sorted(&allocator->free_blocks, block);
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
@@ -187,17 +238,33 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
 void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator) {
     Block *current_block;
-    if (iterator->block_memory == NULL) {
-        current_block = allocator->blocks;
+    bool current_block_is_free;
+
+    if (iterator->memory == NULL) {
+        if (allocator->allocated_blocks != NULL) {
+            current_block = allocator->allocated_blocks;
+            current_block_is_free = false;
+        } else {
+            current_block = allocator->free_blocks;
+            current_block_is_free = true;
+        }
     } else {
-        current_block = memory_to_block(iterator->block_memory)->next;
+        current_block = memory_to_block(iterator->memory)->next;
+        current_block_is_free = iterator->is_free;
+
+        // Switch to iterating over free blocks once we reach the end of "allocated_blocks" list.
+        if (current_block == NULL && !iterator->is_free) {
+            current_block = allocator->free_blocks;
+            current_block_is_free = true;
+        }
     }
 
     if (current_block == NULL) {
-        iterator->block_memory = NULL;
-        iterator->block_size = 0;
+        iterator->memory = NULL;
+        iterator->size = 0;
     } else {
-        iterator->block_memory = block_memory(current_block);
-        iterator->block_size = current_block->size;
+        iterator->memory = block_memory(current_block);
+        iterator->size = current_block->size;
+        iterator->is_free = current_block_is_free;
     }
 }

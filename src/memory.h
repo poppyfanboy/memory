@@ -2,6 +2,7 @@
 #define MEMORY_H
 
 #include <stddef.h>
+#include <stdbool.h>
 
 void memory_set(void *memory, ptrdiff_t size, unsigned char filler);
 void memory_copy(void const *source, ptrdiff_t size, void *dest);
@@ -18,8 +19,9 @@ void heap_deallocate(HeapAllocator *allocator, void *memory);
 void *heap_reallocate(HeapAllocator *allocator, void *memory, ptrdiff_t new_size);
 
 typedef struct {
-    void *block_memory;
-    ptrdiff_t block_size;
+    void *memory;
+    ptrdiff_t size;
+    bool is_free;
 } HeapIterator;
 
 void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator);
