@@ -9,6 +9,7 @@ int main(void) {
     assert(allocator != NULL);
 
     int **values = heap_allocate(allocator, COUNT * sizeof(*values));
+    assert(values != NULL);
 
     for (int i = 0; i < COUNT; i += 1) {
         values[i] = heap_allocate(allocator, sizeof(values[i]));
@@ -18,6 +19,7 @@ int main(void) {
     }
 
     for (int i = 0; i < COUNT; i += 10) {
+        assert(*values[i] == 42);
         heap_deallocate(allocator, values[i]);
     }
 

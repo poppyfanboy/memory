@@ -1,14 +1,19 @@
 #include "memory.h"
 
+#define MEMORY_ALIGNMENT 16
+
 typedef unsigned char u8;
 typedef size_t usize;
 typedef ptrdiff_t isize;
 
-#define ALIGNMENT 16
-#define ALIGN_UP(x) ((usize)(x + ALIGNMENT - 1) & (~(usize)ALIGNMENT + 1))
+#define ALIGN_UP(size, alignment) ((usize)(size + alignment - 1) & (~(usize)alignment + 1))
 
 static inline isize isize_min(isize left, isize right) {
     return left < right ? left : right;
+}
+
+static inline isize isize_max(isize left, isize right) {
+    return left > right ? left : right;
 }
 
 #ifdef _WIN32
@@ -16,7 +21,7 @@ static inline isize isize_min(isize left, isize right) {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-// It is assumed that this function returns addresses aligned to "ALIGNMENT" bytes.
+// It is assumed that this function returns addresses aligned to "MEMORY_ALIGNMENT" bytes.
 void *system_allocate(isize size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
@@ -73,74 +78,119 @@ void memory_move(void const *source, isize size, void *dest) {
     }
 }
 
-#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block))
-
 typedef struct Block Block;
+typedef struct Region Region;
+
+#define REGION_HEADER_SIZE (isize)ALIGN_UP(sizeof(Region), MEMORY_ALIGNMENT)
+#define REGION_MIN_SIZE ((isize)256 * 1024)
+
+struct Region {
+    isize size;
+    Region *previous;
+    Region *next;
+};
+
+typedef Region *RegionList;
+
+static inline Block *region_first_block(Region const *region) {
+    return (Block *)((u8 *)region + REGION_HEADER_SIZE);
+}
+
+static void region_list_prepend(RegionList *list, Region *region) {
+    region->previous = NULL;
+    region->next = *list;
+
+    if (*list != NULL) {
+        (*list)->previous = region;
+    }
+    *list = region;
+}
+
+#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), MEMORY_ALIGNMENT)
 
 struct Block {
     isize size;
-    Block *previous;
-    Block *next;
+    bool last_in_region;
+
+    bool is_free;
+    Block *previous_free;
+    Block *next_free;
 };
 
-static inline void *block_memory(Block *block) {
+static inline void *block_memory(Block const *block) {
     return (u8 *)block + BLOCK_HEADER_SIZE;
 }
 
-static inline Block *memory_to_block(void *memory) {
+static inline Block *block_next(Block const *block) {
+    if (!block->last_in_region) {
+        return (Block *)((u8 *)block + BLOCK_HEADER_SIZE + block->size);
+    } else {
+        return NULL;
+    }
+}
+
+static inline Block *memory_to_block(void const *memory) {
     return (Block *)((u8 *)memory - BLOCK_HEADER_SIZE);
 }
 
-typedef Block *BlockList;
+typedef Block *BlockFreeList;
 
-static inline void block_list_prepend(BlockList *list, Block *block) {
-    block->previous = NULL;
-    block->next = *list;
+static void block_free_list_add(BlockFreeList *list, Block *block) {
+    block->is_free = true;
 
-    if (*list != NULL) {
-        (*list)->previous = block;
-    }
-    *list = block;
-}
-
-static inline void block_list_insert_sorted(BlockList *list, Block *block) {
     Block *previous_block = NULL;
     Block *next_block = *list;
     while (next_block != NULL && block->size > next_block->size) {
         previous_block = next_block;
-        next_block = next_block->next;
+        next_block = next_block->next_free;
     }
 
     if (previous_block == NULL) {
         *list = block;
     }
-    block->previous = previous_block;
-    block->next = next_block;
+    block->previous_free = previous_block;
+    block->next_free = next_block;
 
     if (previous_block != NULL) {
-        previous_block->next = block;
+        previous_block->next_free = block;
     }
     if (next_block != NULL) {
-        next_block->previous = block;
+        next_block->previous_free = block;
     }
 }
 
-static inline void block_list_remove(BlockList *list, Block *block) {
+static void block_free_list_remove(BlockFreeList *list, Block *block) {
+    block->is_free = false;
+
     if (*list == block) {
-        *list = (*list)->next;
+        *list = (*list)->next_free;
     }
 
-    if (block->previous != NULL) {
-        (block->previous)->next = block->next;
+    if (block->previous_free != NULL) {
+        (block->previous_free)->next_free = block->next_free;
     }
-    if (block->next != NULL) {
-        (block->next)->previous = block->previous;
+    if (block->next_free != NULL) {
+        (block->next_free)->previous_free = block->previous_free;
+    }
+}
+
+static Block *block_free_list_get(BlockFreeList *list, isize min_size) {
+    Block *block_iter = *list;
+    while (block_iter != NULL && block_iter->size < min_size) {
+        block_iter = block_iter->next_free;
+    }
+
+    if (block_iter != NULL) {
+        block_free_list_remove(list, block_iter);
+        return block_iter;
+    } else {
+        return NULL;
     }
 }
 
 struct HeapAllocator {
-    BlockList free_blocks;
-    BlockList allocated_blocks;
+    RegionList regions;
+    BlockFreeList free_blocks;
 };
 
 HeapAllocator *heap_allocator_create(void) {
@@ -149,57 +199,48 @@ HeapAllocator *heap_allocator_create(void) {
         return NULL;
     }
 
+    allocator->regions = NULL;
     allocator->free_blocks = NULL;
-    allocator->allocated_blocks = NULL;
 
     return allocator;
 }
 
 void heap_allocator_destroy(HeapAllocator *allocator) {
-    Block *block_iter = NULL;
+    Region *region_iter = allocator->regions;
+    while (region_iter != NULL) {
+        Region *region = region_iter;
+        region_iter = region_iter->next;
 
-    block_iter = allocator->free_blocks;
-    while (block_iter != NULL) {
-        Block *block = block_iter;
-        block_iter = block_iter->next;
-
-        system_deallocate(block);
-    }
-
-    block_iter = allocator->allocated_blocks;
-    while (block_iter != NULL) {
-        Block *block = block_iter;
-        block_iter = block_iter->next;
-
-        system_deallocate(block);
+        system_deallocate(region);
     }
 
     system_deallocate(allocator);
 }
 
 void *heap_allocate(HeapAllocator *allocator, isize size) {
-    size = ALIGN_UP(size);
+    size = ALIGN_UP(size, MEMORY_ALIGNMENT);
     if (size == 0) {
         return NULL;
     }
 
-    Block *free_block = allocator->free_blocks;
-    while (free_block != NULL && free_block->size < size) {
-        free_block = free_block->next;
-    }
+    Block *free_block = block_free_list_get(&allocator->free_blocks, size);
     if (free_block != NULL) {
-        block_list_remove(&allocator->free_blocks, free_block);
-        block_list_prepend(&allocator->allocated_blocks, free_block);
         return block_memory(free_block);
     }
 
-    Block *new_block = system_allocate(size + BLOCK_HEADER_SIZE);
-    if (new_block == NULL) {
+    isize new_region_size = isize_max(size + BLOCK_HEADER_SIZE, REGION_MIN_SIZE);
+    Region *new_region = system_allocate(REGION_HEADER_SIZE + new_region_size);
+    if (new_region == NULL) {
         return NULL;
     }
 
-    new_block->size = size;
-    block_list_prepend(&allocator->allocated_blocks, new_block);
+    new_region->size = new_region_size;
+    region_list_prepend(&allocator->regions, new_region);
+
+    Block *new_block = region_first_block(new_region);
+    new_block->size = new_region_size - BLOCK_HEADER_SIZE;
+    new_block->last_in_region = true;
+    new_block->is_free = false;
 
     return block_memory(new_block);
 }
@@ -210,12 +251,11 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
 
     Block *block = memory_to_block(memory);
-    block_list_remove(&allocator->allocated_blocks, block);
-    block_list_insert_sorted(&allocator->free_blocks, block);
+    block_free_list_add(&allocator->free_blocks, block);
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
-    new_size = ALIGN_UP(new_size);
+    new_size = ALIGN_UP(new_size, MEMORY_ALIGNMENT);
     if (new_size == 0) {
         heap_deallocate(allocator, memory);
         return NULL;
@@ -237,34 +277,34 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 }
 
 void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator) {
-    Block *current_block;
-    bool current_block_is_free;
+    Block *next_block = NULL;
 
-    if (iterator->memory == NULL) {
-        if (allocator->allocated_blocks != NULL) {
-            current_block = allocator->allocated_blocks;
-            current_block_is_free = false;
-        } else {
-            current_block = allocator->free_blocks;
-            current_block_is_free = true;
+    if (iterator->region == NULL) {
+        Region *first_region = allocator->regions;
+
+        if (first_region != NULL) {
+            next_block = region_first_block(first_region);
+            iterator->region = first_region;
         }
     } else {
-        current_block = memory_to_block(iterator->memory)->next;
-        current_block_is_free = iterator->is_free;
+        Block *current_block = memory_to_block(iterator->memory);
+        next_block = block_next(current_block);
 
-        // Switch to iterating over free blocks once we reach the end of "allocated_blocks" list.
-        if (current_block == NULL && !iterator->is_free) {
-            current_block = allocator->free_blocks;
-            current_block_is_free = true;
+        if (next_block == NULL) {
+            Region *region = iterator->region;
+            iterator->region = region->next;
+            if (region->next != NULL) {
+                next_block = region_first_block(region->next);
+            }
         }
     }
 
-    if (current_block == NULL) {
+    if (next_block != NULL) {
+        iterator->memory = block_memory(next_block);
+        iterator->size = next_block->size;
+        iterator->is_free = next_block->is_free;
+    } else {
         iterator->memory = NULL;
         iterator->size = 0;
-    } else {
-        iterator->memory = block_memory(current_block);
-        iterator->size = current_block->size;
-        iterator->is_free = current_block_is_free;
     }
 }

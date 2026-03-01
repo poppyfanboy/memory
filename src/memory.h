@@ -19,6 +19,7 @@ void heap_deallocate(HeapAllocator *allocator, void *memory);
 void *heap_reallocate(HeapAllocator *allocator, void *memory, ptrdiff_t new_size);
 
 typedef struct {
+    void *region;
     void *memory;
     ptrdiff_t size;
     bool is_free;
