@@ -3,6 +3,22 @@
 
 #include "../src/memory.h"
 
+void heap_dump(HeapAllocator const *allocator) {
+    HeapIterator iterator = {0};
+    heap_iterate(allocator, &iterator);
+
+    while (iterator.memory != NULL) {
+        printf(
+            "%s block of size %td at address 0x%p\n",
+            iterator.is_free ? "Free" : "Occupied",
+            iterator.size,
+            iterator.memory
+        );
+
+        heap_iterate(allocator, &iterator);
+    }
+}
+
 int main(void) {
     HeapAllocator *allocator = heap_allocator_create();
     assert(allocator != NULL);
@@ -28,19 +44,8 @@ int main(void) {
     assert(a1 != NULL);
     heap_deallocate(allocator, a1);
 
-    HeapIterator iterator = {0};
-    heap_iterate(allocator, &iterator);
+    heap_dump(allocator);
 
-    while (iterator.memory != NULL) {
-        printf(
-            "%s block of size %td at address 0x%p\n",
-            iterator.is_free ? "Free" : "Occupied",
-            iterator.size,
-            iterator.memory
-        );
-
-        heap_iterate(allocator, &iterator);
-    }
-
+    heap_allocator_destroy(allocator);
     return 0;
 }

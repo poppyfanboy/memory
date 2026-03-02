@@ -1,8 +1,25 @@
 #include <assert.h>
+#include <stdio.h>
 
 #include "../src/memory.h"
 
-#define COUNT 10000
+void heap_dump(HeapAllocator const *allocator) {
+    HeapIterator iterator = {0};
+    heap_iterate(allocator, &iterator);
+
+    while (iterator.memory != NULL) {
+        printf(
+            "%s block of size %td at address 0x%p\n",
+            iterator.is_free ? "Free" : "Occupied",
+            iterator.size,
+            iterator.memory
+        );
+
+        heap_iterate(allocator, &iterator);
+    }
+}
+
+#define COUNT 25000
 
 typedef struct {
     int *values;
@@ -12,7 +29,7 @@ typedef struct {
 
 void array_push(Array *array, int value, HeapAllocator *allocator) {
     if (array->count == array->capacity) {
-        int new_capacity = array->capacity > 0 ? 2 * array->capacity : 16;
+        int new_capacity = array->capacity > 0 ? 3 * array->capacity / 2 : 16;
 
         array->values = heap_reallocate(
             allocator,
@@ -36,6 +53,8 @@ int main(void) {
     for (int i = 0; i < COUNT; i += 1) {
         array_push(&array, i, allocator);
     }
+
+    heap_dump(allocator);
 
     for (int i = 0; i < array.count; i += 1) {
         assert(array.values[i] == i);

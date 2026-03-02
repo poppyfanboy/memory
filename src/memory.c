@@ -107,10 +107,12 @@ static void region_list_prepend(RegionList *list, Region *region) {
 }
 
 #define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), MEMORY_ALIGNMENT)
+#define BLOCK_MIN_SIZE (isize)16
 
 struct Block {
     isize size;
     bool last_in_region;
+    Block *previous_block;
 
     bool is_free;
     Block *previous_free;
@@ -131,6 +133,29 @@ static inline Block *block_next(Block const *block) {
 
 static inline Block *memory_to_block(void const *memory) {
     return (Block *)((u8 *)memory - BLOCK_HEADER_SIZE);
+}
+
+static Block *block_split(Block *block, isize new_size) {
+    isize min_size_to_split = new_size + (BLOCK_HEADER_SIZE + BLOCK_MIN_SIZE);
+    if (block->size < min_size_to_split) {
+        return NULL;
+    }
+
+    Block *remainder_block = (Block *)((u8 *)block + (BLOCK_HEADER_SIZE + new_size));
+    remainder_block->size = block->size - (BLOCK_HEADER_SIZE + new_size);
+    remainder_block->last_in_region = block->last_in_region;
+    remainder_block->is_free = true;
+    remainder_block->previous_block = block;
+
+    block->size = new_size;
+    block->last_in_region = false;
+
+    Block *next_block = block_next(remainder_block);
+    if (next_block != NULL) {
+        next_block->previous_block = remainder_block;
+    }
+
+    return remainder_block;
 }
 
 typedef Block *BlockFreeList;
@@ -217,6 +242,47 @@ void heap_allocator_destroy(HeapAllocator *allocator) {
     system_deallocate(allocator);
 }
 
+void heap_deallocate_block(HeapAllocator *allocator, Block *block) {
+    Block *previous_block = block->previous_block;
+    bool previous_block_is_free = previous_block != NULL && previous_block->is_free;
+
+    Block *next_block = block_next(block);
+    bool next_block_is_free = next_block != NULL && next_block->is_free;
+
+    if (!previous_block_is_free && !next_block_is_free) {
+        block_free_list_add(&allocator->free_blocks, block);
+        return;
+    }
+
+    Block *merged_block = block;
+    isize merged_block_size = block->size;
+    bool merged_block_last = block->last_in_region;
+    Block *merged_block_previous = block->previous_block;
+
+    if (previous_block_is_free) {
+        merged_block = previous_block;
+        merged_block_size += BLOCK_HEADER_SIZE + previous_block->size;
+        merged_block_previous = previous_block->previous_block;
+        block_free_list_remove(&allocator->free_blocks, previous_block);
+    }
+    if (next_block_is_free) {
+        merged_block_size += BLOCK_HEADER_SIZE + next_block->size;
+        merged_block_last = next_block->last_in_region;
+        block_free_list_remove(&allocator->free_blocks, next_block);
+    }
+
+    merged_block->size = merged_block_size;
+    merged_block->last_in_region = merged_block_last;
+    merged_block->previous_block = merged_block_previous;
+
+    block_free_list_add(&allocator->free_blocks, merged_block);
+
+    next_block = block_next(merged_block);
+    if (next_block != NULL) {
+        next_block->previous_block = merged_block;
+    }
+}
+
 void *heap_allocate(HeapAllocator *allocator, isize size) {
     size = ALIGN_UP(size, MEMORY_ALIGNMENT);
     if (size == 0) {
@@ -225,6 +291,11 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
 
     Block *free_block = block_free_list_get(&allocator->free_blocks, size);
     if (free_block != NULL) {
+        Block *remainder_block = block_split(free_block, size);
+        if (remainder_block != NULL) {
+            heap_deallocate_block(allocator, remainder_block);
+        }
+
         return block_memory(free_block);
     }
 
@@ -240,7 +311,13 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     Block *new_block = region_first_block(new_region);
     new_block->size = new_region_size - BLOCK_HEADER_SIZE;
     new_block->last_in_region = true;
+    new_block->previous_block = NULL;
     new_block->is_free = false;
+
+    Block *remainder_block = block_split(new_block, size);
+    if (remainder_block != NULL) {
+        heap_deallocate_block(allocator, remainder_block);
+    }
 
     return block_memory(new_block);
 }
@@ -251,7 +328,7 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
 
     Block *block = memory_to_block(memory);
-    block_free_list_add(&allocator->free_blocks, block);
+    heap_deallocate_block(allocator, block);
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
@@ -276,7 +353,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     return new_memory;
 }
 
-void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator) {
+void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
     Block *next_block = NULL;
 
     if (iterator->region == NULL) {

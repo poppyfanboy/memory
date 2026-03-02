@@ -25,6 +25,6 @@ typedef struct {
     bool is_free;
 } HeapIterator;
 
-void heap_iterate(HeapAllocator *allocator, HeapIterator *iterator);
+void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator);
 
 #endif
