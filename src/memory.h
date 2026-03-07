@@ -10,7 +10,14 @@ void memory_move(void const *source, ptrdiff_t size, void *dest);
 
 typedef struct HeapAllocator HeapAllocator;
 
-HeapAllocator *heap_allocator_create(void);
+// SystemAllocate is expected to return addresses aligned to at least 16 bytes.
+typedef void *(*SystemAllocate)(ptrdiff_t size);
+typedef void (*SystemDeallocate)(void *memory);
+HeapAllocator *heap_allocator_create(SystemAllocate allocate, SystemDeallocate deallocate);
+
+typedef void *(*SystemHeapGrow)(ptrdiff_t increment);
+HeapAllocator *heap_allocator_from_system_heap(SystemHeapGrow heap_grow);
+
 void heap_allocator_destroy(HeapAllocator *allocator);
 
 void *heap_allocate(HeapAllocator *allocator, ptrdiff_t size);

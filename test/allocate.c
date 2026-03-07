@@ -1,11 +1,11 @@
 #include <assert.h>
 
-#include "../src/memory.h"
+#include "test_common.c"
 
 #define COUNT 10000
 
 int main(void) {
-    HeapAllocator *allocator = heap_allocator_create();
+    HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
     assert(allocator != NULL);
 
     int **values = heap_allocate(allocator, COUNT * sizeof(*values));

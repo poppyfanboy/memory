@@ -1,23 +1,6 @@
 #include <assert.h>
-#include <stdio.h>
 
-#include "../src/memory.h"
-
-void heap_dump(HeapAllocator const *allocator) {
-    HeapIterator iterator = {0};
-    heap_iterate(allocator, &iterator);
-
-    while (iterator.memory != NULL) {
-        printf(
-            "%s block of size %td at address 0x%p\n",
-            iterator.is_free ? "Free" : "Occupied",
-            iterator.size,
-            iterator.memory
-        );
-
-        heap_iterate(allocator, &iterator);
-    }
-}
+#include "test_common.c"
 
 #define COUNT 25000
 
@@ -46,7 +29,7 @@ void array_push(Array *array, int value, HeapAllocator *allocator) {
 }
 
 int main(void) {
-    HeapAllocator *allocator = heap_allocator_create();
+    HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
     assert(allocator != NULL);
 
     Array array = {0};

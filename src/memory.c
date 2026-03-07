@@ -1,12 +1,12 @@
 #include "memory.h"
 
-#define MEMORY_ALIGNMENT 16
+#define ALIGNMENT 16
 
 typedef unsigned char u8;
 typedef size_t usize;
 typedef ptrdiff_t isize;
 
-#define ALIGN_UP(size, alignment) ((usize)(size + alignment - 1) & (~(usize)alignment + 1))
+#define ALIGN_UP(value, alignment) (((usize)(value) + (alignment) - 1) & (~(usize)(alignment) + 1))
 
 static inline isize isize_min(isize left, isize right) {
     return left < right ? left : right;
@@ -15,22 +15,6 @@ static inline isize isize_min(isize left, isize right) {
 static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
-
-#ifdef _WIN32
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-
-// It is assumed that this function returns addresses aligned to "MEMORY_ALIGNMENT" bytes.
-void *system_allocate(isize size) {
-    return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-}
-
-void system_deallocate(void *memory) {
-    VirtualFree(memory, 0, MEM_RELEASE);
-}
-
-#endif // _WIN32
 
 void memory_set(void *memory, isize size, u8 filler) {
     u8 *memory_bytes = memory;
@@ -81,7 +65,7 @@ void memory_move(void const *source, isize size, void *dest) {
 typedef struct Block Block;
 typedef struct Region Region;
 
-#define REGION_HEADER_SIZE (isize)ALIGN_UP(sizeof(Region), MEMORY_ALIGNMENT)
+#define REGION_HEADER_SIZE (isize)ALIGN_UP(sizeof(Region), ALIGNMENT)
 #define REGION_MIN_SIZE ((isize)256 * 1024)
 
 struct Region {
@@ -106,7 +90,7 @@ static void region_list_prepend(RegionList *list, Region *region) {
     *list = region;
 }
 
-#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), MEMORY_ALIGNMENT)
+#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), ALIGNMENT)
 #define BLOCK_MIN_SIZE (isize)16
 
 struct Block {
@@ -216,9 +200,16 @@ static Block *block_free_list_get(BlockFreeList *list, isize min_size) {
 struct HeapAllocator {
     RegionList regions;
     BlockFreeList free_blocks;
+
+    SystemAllocate system_allocate;
+    SystemDeallocate system_deallocate;
+    SystemHeapGrow system_heap_grow;
 };
 
-HeapAllocator *heap_allocator_create(void) {
+HeapAllocator *heap_allocator_create(
+    SystemAllocate system_allocate,
+    SystemDeallocate system_deallocate
+) {
     HeapAllocator *allocator = system_allocate(sizeof(HeapAllocator));
     if (allocator == NULL) {
         return NULL;
@@ -227,22 +218,52 @@ HeapAllocator *heap_allocator_create(void) {
     allocator->regions = NULL;
     allocator->free_blocks = NULL;
 
+    allocator->system_allocate = system_allocate;
+    allocator->system_deallocate = system_deallocate;
+    allocator->system_heap_grow = NULL;
+
+    return allocator;
+}
+
+HeapAllocator *heap_allocator_from_system_heap(SystemHeapGrow system_heap_grow) {
+    // Align the system heap base, so that all subsequent allocations are properly aligned.
+    void *system_heap_base = system_heap_grow(0);
+    if (system_heap_base == NULL) {
+        return NULL;
+    }
+    usize heap_base_alignment = ALIGN_UP(system_heap_base, ALIGNMENT) - (usize)system_heap_base;
+    system_heap_grow(heap_base_alignment);
+
+    HeapAllocator *allocator = system_heap_grow(ALIGN_UP(sizeof(HeapAllocator), ALIGNMENT));
+    if (allocator == NULL) {
+        return NULL;
+    }
+
+    allocator->regions = NULL;
+    allocator->free_blocks = NULL;
+
+    allocator->system_allocate = NULL;
+    allocator->system_deallocate = NULL;
+    allocator->system_heap_grow = system_heap_grow;
+
     return allocator;
 }
 
 void heap_allocator_destroy(HeapAllocator *allocator) {
-    Region *region_iter = allocator->regions;
-    while (region_iter != NULL) {
-        Region *region = region_iter;
-        region_iter = region_iter->next;
+    if (allocator->system_deallocate != NULL) {
+        Region *region_iter = allocator->regions;
+        while (region_iter != NULL) {
+            Region *region = region_iter;
+            region_iter = region_iter->next;
 
-        system_deallocate(region);
+            allocator->system_deallocate(region);
+        }
+
+        allocator->system_deallocate(allocator);
     }
-
-    system_deallocate(allocator);
 }
 
-void heap_deallocate_block(HeapAllocator *allocator, Block *block) {
+static void heap_deallocate_block(HeapAllocator *allocator, Block *block) {
     Block *previous_block = block->previous_block;
     bool previous_block_is_free = previous_block != NULL && previous_block->is_free;
 
@@ -284,7 +305,7 @@ void heap_deallocate_block(HeapAllocator *allocator, Block *block) {
 }
 
 void *heap_allocate(HeapAllocator *allocator, isize size) {
-    size = ALIGN_UP(size, MEMORY_ALIGNMENT);
+    size = ALIGN_UP(size, ALIGNMENT);
     if (size == 0) {
         return NULL;
     }
@@ -300,7 +321,13 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     }
 
     isize new_region_size = isize_max(size + BLOCK_HEADER_SIZE, REGION_MIN_SIZE);
-    Region *new_region = system_allocate(REGION_HEADER_SIZE + new_region_size);
+
+    Region *new_region;
+    if (allocator->system_allocate != NULL) {
+        new_region = allocator->system_allocate(REGION_HEADER_SIZE + new_region_size);
+    } else {
+        new_region = allocator->system_heap_grow(REGION_HEADER_SIZE + new_region_size);
+    }
     if (new_region == NULL) {
         return NULL;
     }
@@ -332,7 +359,7 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
-    new_size = ALIGN_UP(new_size, MEMORY_ALIGNMENT);
+    new_size = ALIGN_UP(new_size, ALIGNMENT);
     if (new_size == 0) {
         heap_deallocate(allocator, memory);
         return NULL;
