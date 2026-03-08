@@ -1,10 +1,11 @@
 #include "memory.h"
 
-#define ALIGNMENT 16
-
 typedef unsigned char u8;
 typedef size_t usize;
 typedef ptrdiff_t isize;
+
+// This must be at least 8, because 3 lower bits of the block sizes are used for storing bit flags.
+#define ALIGNMENT 16
 
 #define ALIGN_UP(value, alignment) (((usize)(value) + (alignment) - 1) & (~(usize)(alignment) + 1))
 
@@ -69,6 +70,7 @@ typedef struct Region Region;
 #define REGION_MIN_SIZE ((isize)256 * 1024)
 
 struct Region {
+    // Size of the memory available inside of the region (excluding the header size).
     isize size;
     Region *previous;
     Region *next;
@@ -90,53 +92,65 @@ static void region_list_prepend(RegionList *list, Region *region) {
     *list = region;
 }
 
-#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), ALIGNMENT)
-#define BLOCK_MIN_SIZE (isize)16
-
 struct Block {
-    isize size;
-    bool last_in_region;
-    Block *previous_block;
-
-    bool is_free;
-    Block *previous_free;
-    Block *next_free;
+    // Size of the memory available inside of the block (excluding the header size).
+    // Lower 3 bits are used for storing flags.
+    usize size;
 };
 
-static inline void *block_memory(Block const *block) {
-    return (u8 *)block + BLOCK_HEADER_SIZE;
-}
+#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), ALIGNMENT)
 
-static inline Block *block_next(Block const *block) {
-    if (!block->last_in_region) {
-        return (Block *)((u8 *)block + BLOCK_HEADER_SIZE + block->size);
-    } else {
-        return NULL;
-    }
-}
+// This must be at least (3 * sizeof(usize)), because free blocks store additional information:
+// - Two pointers for the intrusive free-lists right after the header.
+// - Size of the block at the very end of the block.
+#define BLOCK_MIN_SIZE (isize)32
 
-static inline Block *memory_to_block(void const *memory) {
-    return (Block *)((u8 *)memory - BLOCK_HEADER_SIZE);
-}
+// Since block sizes are always multiples of "ALIGNMENT", lower bits of block sizes are naturally
+// zero and thus can be used to store additional information.
+#define BLOCK_IS_FREE_BIT (usize)0x1
+#define BLOCK_PREVIOUS_IS_FREE_BIT (usize)0x2
+#define BLOCK_LAST_IN_REGION_BIT (usize)0x4
+#define BLOCK_FLAG_BITS (BLOCK_IS_FREE_BIT | BLOCK_PREVIOUS_IS_FREE_BIT | BLOCK_LAST_IN_REGION_BIT)
+
+#define BLOCK_SIZE(block) (isize)((block)->size & ~BLOCK_FLAG_BITS)
+#define BLOCK_IS_FREE(block) (((block)->size & BLOCK_IS_FREE_BIT) != 0)
+#define BLOCK_PREVIOUS_IS_FREE(block) (((block)->size & BLOCK_PREVIOUS_IS_FREE_BIT) != 0)
+#define BLOCK_LAST_IN_REGION(block) (((block)->size & BLOCK_LAST_IN_REGION_BIT) != 0)
+
+#define BLOCK_MEMORY(block) (void *)((u8 *)(block) + BLOCK_HEADER_SIZE)
+#define BLOCK_FROM_MEMORY(memory) ((Block *)((u8 *)(memory) - BLOCK_HEADER_SIZE))
+
+// Accessing the previous block (or its size) is allowed only when previous block is marked as free.
+// When the previous block is free, it stores its size right before the current block's header.
+#define BLOCK_PREVIOUS_SIZE(block) (isize *)((u8 *)(block) - sizeof(isize))
+#define BLOCK_PREVIOUS(block) \
+    ((Block *)((u8 *)(block) - BLOCK_HEADER_SIZE - *BLOCK_PREVIOUS_SIZE(block)))
+
+// Always check for BLOCK_LAST_IN_REGION() before accessing this.
+#define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
+
+#define BLOCK_PREVIOUS_FREE(block) ((Block **)((u8 *)block + BLOCK_HEADER_SIZE))
+#define BLOCK_NEXT_FREE(block) ((Block **)((u8 *)block + BLOCK_HEADER_SIZE + sizeof(Block *)))
 
 static Block *block_split(Block *block, isize new_size) {
     isize min_size_to_split = new_size + (BLOCK_HEADER_SIZE + BLOCK_MIN_SIZE);
-    if (block->size < min_size_to_split) {
+    if (BLOCK_SIZE(block) < min_size_to_split) {
         return NULL;
     }
+    isize remainder_block_size = BLOCK_SIZE(block) - (BLOCK_HEADER_SIZE + new_size);
 
     Block *remainder_block = (Block *)((u8 *)block + (BLOCK_HEADER_SIZE + new_size));
-    remainder_block->size = block->size - (BLOCK_HEADER_SIZE + new_size);
-    remainder_block->last_in_region = block->last_in_region;
-    remainder_block->is_free = true;
-    remainder_block->previous_block = block;
+    remainder_block->size = remainder_block_size | BLOCK_IS_FREE_BIT;
+    remainder_block->size |= (block->size & BLOCK_PREVIOUS_IS_FREE_BIT);
+    remainder_block->size |= (block->size & BLOCK_LAST_IN_REGION_BIT);
+    if (BLOCK_IS_FREE(block)) {
+        *BLOCK_PREVIOUS_SIZE(remainder_block) = BLOCK_SIZE(block);
+    }
 
-    block->size = new_size;
-    block->last_in_region = false;
-
-    Block *next_block = block_next(remainder_block);
-    if (next_block != NULL) {
-        next_block->previous_block = remainder_block;
+    usize block_flags = (block->size & BLOCK_FLAG_BITS) & ~BLOCK_LAST_IN_REGION_BIT;
+    block->size = new_size | block_flags;
+    if (!BLOCK_LAST_IN_REGION(remainder_block)) {
+        *BLOCK_PREVIOUS_SIZE(BLOCK_NEXT(remainder_block)) = BLOCK_SIZE(remainder_block);
     }
 
     return remainder_block;
@@ -145,48 +159,47 @@ static Block *block_split(Block *block, isize new_size) {
 typedef Block *BlockFreeList;
 
 static void block_free_list_add(BlockFreeList *list, Block *block) {
-    block->is_free = true;
-
     Block *previous_block = NULL;
     Block *next_block = *list;
-    while (next_block != NULL && block->size > next_block->size) {
+    while (next_block != NULL && BLOCK_SIZE(block) > BLOCK_SIZE(next_block)) {
         previous_block = next_block;
-        next_block = next_block->next_free;
+        next_block = *BLOCK_NEXT_FREE(next_block);
     }
 
     if (previous_block == NULL) {
         *list = block;
     }
-    block->previous_free = previous_block;
-    block->next_free = next_block;
+    *BLOCK_PREVIOUS_FREE(block) = previous_block;
+    *BLOCK_NEXT_FREE(block) = next_block;
 
     if (previous_block != NULL) {
-        previous_block->next_free = block;
+        *BLOCK_NEXT_FREE(previous_block) = block;
     }
     if (next_block != NULL) {
-        next_block->previous_free = block;
+        *BLOCK_PREVIOUS_FREE(next_block) = block;
     }
 }
 
 static void block_free_list_remove(BlockFreeList *list, Block *block) {
-    block->is_free = false;
-
     if (*list == block) {
-        *list = (*list)->next_free;
+        *list = *BLOCK_NEXT_FREE(*list);
     }
 
-    if (block->previous_free != NULL) {
-        (block->previous_free)->next_free = block->next_free;
+    Block *previous_free = *BLOCK_PREVIOUS_FREE(block);
+    if (previous_free != NULL) {
+        *BLOCK_NEXT_FREE(previous_free) = *BLOCK_NEXT_FREE(block);
     }
-    if (block->next_free != NULL) {
-        (block->next_free)->previous_free = block->previous_free;
+
+    Block *next_free = *BLOCK_NEXT_FREE(block);
+    if (next_free != NULL) {
+        *BLOCK_PREVIOUS_FREE(next_free) = *BLOCK_PREVIOUS_FREE(block);
     }
 }
 
 static Block *block_free_list_get(BlockFreeList *list, isize min_size) {
     Block *block_iter = *list;
-    while (block_iter != NULL && block_iter->size < min_size) {
-        block_iter = block_iter->next_free;
+    while (block_iter != NULL && BLOCK_SIZE(block_iter) < min_size) {
+        block_iter = *BLOCK_NEXT_FREE(block_iter);
     }
 
     if (block_iter != NULL) {
@@ -263,61 +276,27 @@ void heap_allocator_destroy(HeapAllocator *allocator) {
     }
 }
 
-static void heap_deallocate_block(HeapAllocator *allocator, Block *block) {
-    Block *previous_block = block->previous_block;
-    bool previous_block_is_free = previous_block != NULL && previous_block->is_free;
-
-    Block *next_block = block_next(block);
-    bool next_block_is_free = next_block != NULL && next_block->is_free;
-
-    if (!previous_block_is_free && !next_block_is_free) {
-        block_free_list_add(&allocator->free_blocks, block);
-        return;
-    }
-
-    Block *merged_block = block;
-    isize merged_block_size = block->size;
-    bool merged_block_last = block->last_in_region;
-    Block *merged_block_previous = block->previous_block;
-
-    if (previous_block_is_free) {
-        merged_block = previous_block;
-        merged_block_size += BLOCK_HEADER_SIZE + previous_block->size;
-        merged_block_previous = previous_block->previous_block;
-        block_free_list_remove(&allocator->free_blocks, previous_block);
-    }
-    if (next_block_is_free) {
-        merged_block_size += BLOCK_HEADER_SIZE + next_block->size;
-        merged_block_last = next_block->last_in_region;
-        block_free_list_remove(&allocator->free_blocks, next_block);
-    }
-
-    merged_block->size = merged_block_size;
-    merged_block->last_in_region = merged_block_last;
-    merged_block->previous_block = merged_block_previous;
-
-    block_free_list_add(&allocator->free_blocks, merged_block);
-
-    next_block = block_next(merged_block);
-    if (next_block != NULL) {
-        next_block->previous_block = merged_block;
-    }
-}
-
 void *heap_allocate(HeapAllocator *allocator, isize size) {
-    size = ALIGN_UP(size, ALIGNMENT);
     if (size == 0) {
         return NULL;
     }
+
+    size = isize_max(size, BLOCK_MIN_SIZE);
+    size = ALIGN_UP(size, ALIGNMENT);
 
     Block *free_block = block_free_list_get(&allocator->free_blocks, size);
     if (free_block != NULL) {
         Block *remainder_block = block_split(free_block, size);
         if (remainder_block != NULL) {
-            heap_deallocate_block(allocator, remainder_block);
+            block_free_list_add(&allocator->free_blocks, remainder_block);
         }
 
-        return block_memory(free_block);
+        free_block->size &= ~BLOCK_IS_FREE_BIT;
+        if (!BLOCK_LAST_IN_REGION(free_block)) {
+            BLOCK_NEXT(free_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
+        }
+
+        return BLOCK_MEMORY(free_block);
     }
 
     isize new_region_size = isize_max(size + BLOCK_HEADER_SIZE, REGION_MIN_SIZE);
@@ -336,26 +315,65 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     region_list_prepend(&allocator->regions, new_region);
 
     Block *new_block = region_first_block(new_region);
-    new_block->size = new_region_size - BLOCK_HEADER_SIZE;
-    new_block->last_in_region = true;
-    new_block->previous_block = NULL;
-    new_block->is_free = false;
+    new_block->size = (new_region_size - BLOCK_HEADER_SIZE) | BLOCK_IS_FREE_BIT;
+    new_block->size |= BLOCK_LAST_IN_REGION_BIT;
 
     Block *remainder_block = block_split(new_block, size);
     if (remainder_block != NULL) {
-        heap_deallocate_block(allocator, remainder_block);
+        block_free_list_add(&allocator->free_blocks, remainder_block);
     }
 
-    return block_memory(new_block);
+    new_block->size &= ~BLOCK_IS_FREE_BIT;
+    if (!BLOCK_LAST_IN_REGION(new_block)) {
+        BLOCK_NEXT(new_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
+    }
+
+    return BLOCK_MEMORY(new_block);
 }
 
 void heap_deallocate(HeapAllocator *allocator, void *memory) {
     if (memory == NULL) {
         return;
     }
+    Block *block = BLOCK_FROM_MEMORY(memory);
 
-    Block *block = memory_to_block(memory);
-    heap_deallocate_block(allocator, block);
+    Block *previous_block = NULL;
+    if (BLOCK_PREVIOUS_IS_FREE(block)) {
+        previous_block = BLOCK_PREVIOUS(block);
+    }
+
+    Block *next_block = NULL;
+    if (!BLOCK_LAST_IN_REGION(block) && BLOCK_IS_FREE(BLOCK_NEXT(block))) {
+        next_block = BLOCK_NEXT(block);
+    }
+
+    Block *merged_block = block;
+    isize merged_block_size = BLOCK_SIZE(block);
+    usize merged_block_previous_is_free_bit = merged_block->size & BLOCK_PREVIOUS_IS_FREE_BIT;
+    usize merged_block_last_in_region_bit = merged_block->size & BLOCK_LAST_IN_REGION_BIT;
+
+    if (previous_block != NULL) {
+        merged_block = previous_block;
+        merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(previous_block);
+        merged_block_previous_is_free_bit = previous_block->size & BLOCK_PREVIOUS_IS_FREE_BIT;
+        block_free_list_remove(&allocator->free_blocks, previous_block);
+    }
+    if (next_block != NULL) {
+        merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(next_block);
+        merged_block_last_in_region_bit = next_block->size & BLOCK_LAST_IN_REGION_BIT;
+        block_free_list_remove(&allocator->free_blocks, next_block);
+    }
+
+    merged_block->size = merged_block_size | BLOCK_IS_FREE_BIT;
+    merged_block->size |= merged_block_previous_is_free_bit;
+    merged_block->size |= merged_block_last_in_region_bit;
+    block_free_list_add(&allocator->free_blocks, merged_block);
+
+    if (!BLOCK_LAST_IN_REGION(merged_block)) {
+        Block *next_block_after_merged = BLOCK_NEXT(merged_block);
+        next_block_after_merged->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+        *BLOCK_PREVIOUS_SIZE(next_block_after_merged) = merged_block_size;
+    }
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
@@ -371,8 +389,8 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     }
 
     if (memory != NULL) {
-        Block *block = memory_to_block(memory);
-        memory_copy(memory, isize_min(block->size, new_size), new_memory);
+        Block *block = BLOCK_FROM_MEMORY(memory);
+        memory_copy(memory, isize_min(BLOCK_SIZE(block), new_size), new_memory);
 
         heap_deallocate(allocator, memory);
     }
@@ -391,10 +409,11 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
             iterator->region = first_region;
         }
     } else {
-        Block *current_block = memory_to_block(iterator->memory);
-        next_block = block_next(current_block);
+        Block *current_block = BLOCK_FROM_MEMORY(iterator->memory);
 
-        if (next_block == NULL) {
+        if (!BLOCK_LAST_IN_REGION(current_block)) {
+            next_block = BLOCK_NEXT(current_block);
+        } else {
             Region *region = iterator->region;
             iterator->region = region->next;
             if (region->next != NULL) {
@@ -404,9 +423,9 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
     }
 
     if (next_block != NULL) {
-        iterator->memory = block_memory(next_block);
-        iterator->size = next_block->size;
-        iterator->is_free = next_block->is_free;
+        iterator->memory = BLOCK_MEMORY(next_block);
+        iterator->size = BLOCK_SIZE(next_block);
+        iterator->is_free = BLOCK_IS_FREE(next_block);
     } else {
         iterator->memory = NULL;
         iterator->size = 0;
