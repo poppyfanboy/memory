@@ -1,13 +1,52 @@
 #include "memory.h"
 
+#include <stdint.h>
+
 typedef unsigned char u8;
+typedef uint64_t u64;
 typedef size_t usize;
 typedef ptrdiff_t isize;
+
+#define ARRAY_COUNT(array) (isize)(sizeof(array) / sizeof((array)[0]))
 
 // This must be at least 8, because 3 lower bits of the block sizes are used for storing bit flags.
 #define ALIGNMENT 16
 
 #define ALIGN_UP(value, alignment) (((usize)(value) + (alignment) - 1) & (~(usize)(alignment) + 1))
+#define ALIGN_DOWN(value, alignment) ((usize)(value) & (~(usize)(alignment) + 1))
+
+// https://graphics.stanford.edu/~seander/bithacks.html#ZerosOnRightParallel
+static inline int u64_trailing_zeroes(u64 value) {
+    if (value == 0) {
+        return 64;
+    }
+
+    // Isolate the lowest set bit.
+    value &= (~value + 1);
+
+    // Determine which half has the set bit, then determine which quarter has the bit, and so on.
+    int trailing_zeroes = 63;
+    if ((value & 0x00000000ffffffff) != 0) {
+        trailing_zeroes -= 32;
+    }
+    if ((value & 0x0000ffff0000ffff) != 0) {
+        trailing_zeroes -= 16;
+    }
+    if ((value & 0x00ff00ff00ff00ff) != 0) {
+        trailing_zeroes -= 8;
+    }
+    if ((value & 0x0f0f0f0f0f0f0f0f) != 0) {
+        trailing_zeroes -= 4;
+    }
+    if ((value & 0x3333333333333333) != 0) {
+        trailing_zeroes -= 2;
+    }
+    if ((value & 0x5555555555555555) != 0) {
+        trailing_zeroes -= 1;
+    }
+
+    return trailing_zeroes;
+}
 
 static inline isize isize_min(isize left, isize right) {
     return left < right ? left : right;
@@ -70,7 +109,7 @@ typedef struct Region Region;
 #define REGION_MIN_SIZE ((isize)256 * 1024)
 
 struct Region {
-    // Size of the memory available inside of the region (excluding the header size).
+    // Size of the memory available inside of the region (i.e. header size is not included).
     isize size;
     Region *previous;
     Region *next;
@@ -93,8 +132,8 @@ static void region_list_prepend(RegionList *list, Region *region) {
 }
 
 struct Block {
-    // Size of the memory available inside of the block (excluding the header size).
-    // Lower 3 bits are used for storing flags.
+    // Size of the memory available inside of the block (i.e. header size is not included).
+    // You can't use this value to access size directly: lower 3 bits are used for storing flags.
     usize size;
 };
 
@@ -212,7 +251,9 @@ static Block *block_free_list_get(BlockFreeList *list, isize min_size) {
 
 struct HeapAllocator {
     RegionList regions;
-    BlockFreeList free_blocks;
+
+    u64 free_blocks_availability;
+    BlockFreeList free_blocks[64];
 
     SystemAllocate system_allocate;
     SystemDeallocate system_deallocate;
@@ -229,7 +270,8 @@ HeapAllocator *heap_allocator_create(
     }
 
     allocator->regions = NULL;
-    allocator->free_blocks = NULL;
+    allocator->free_blocks_availability = 0;
+    memory_set(allocator->free_blocks, sizeof(allocator->free_blocks), 0);
 
     allocator->system_allocate = system_allocate;
     allocator->system_deallocate = system_deallocate;
@@ -253,7 +295,8 @@ HeapAllocator *heap_allocator_from_system_heap(SystemHeapGrow system_heap_grow) 
     }
 
     allocator->regions = NULL;
-    allocator->free_blocks = NULL;
+    allocator->free_blocks_availability = 0;
+    memory_set(allocator->free_blocks, sizeof(allocator->free_blocks), 0);
 
     allocator->system_allocate = NULL;
     allocator->system_deallocate = NULL;
@@ -276,6 +319,34 @@ void heap_allocator_destroy(HeapAllocator *allocator) {
     }
 }
 
+static inline isize heap_allocator_free_list_index(HeapAllocator const *allocator, isize size) {
+    size = ALIGN_DOWN(size, ALIGNMENT);
+
+    isize const MIN_SIZE = ALIGN_UP(BLOCK_MIN_SIZE, ALIGNMENT);
+    isize list_index = isize_min(
+        (size - MIN_SIZE) / ALIGNMENT,
+        ARRAY_COUNT(allocator->free_blocks) - 1
+    );
+
+    return list_index;
+}
+
+static inline void heap_allocator_free_list_add(HeapAllocator *allocator, Block *block) {
+    isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
+    block_free_list_add(&allocator->free_blocks[list_index], block);
+
+    allocator->free_blocks_availability |= ((u64)1 << list_index);
+}
+
+static inline void heap_allocator_free_list_remove(HeapAllocator *allocator, Block *block) {
+    isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
+    block_free_list_remove(&allocator->free_blocks[list_index], block);
+
+    if (allocator->free_blocks[list_index] == NULL) {
+        allocator->free_blocks_availability &= ~((u64)1 << list_index);
+    }
+}
+
 void *heap_allocate(HeapAllocator *allocator, isize size) {
     if (size == 0) {
         return NULL;
@@ -284,20 +355,32 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     size = isize_max(size, BLOCK_MIN_SIZE);
     size = ALIGN_UP(size, ALIGNMENT);
 
-    Block *free_block = block_free_list_get(&allocator->free_blocks, size);
-    if (free_block != NULL) {
-        Block *remainder_block = block_split(free_block, size);
-        if (remainder_block != NULL) {
-            block_free_list_add(&allocator->free_blocks, remainder_block);
-        }
+    // Try to take a block from one of the free lists.
 
-        free_block->size &= ~BLOCK_IS_FREE_BIT;
-        if (!BLOCK_LAST_IN_REGION(free_block)) {
-            BLOCK_NEXT(free_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
-        }
+    isize free_list_min_index = heap_allocator_free_list_index(allocator, size);
+    u64 free_blocks_availability_mask = ~(((u64)1 << free_list_min_index) - 1);
+    if ((allocator->free_blocks_availability & free_blocks_availability_mask) != 0) {
+        int free_list_index = u64_trailing_zeroes(
+            allocator->free_blocks_availability & free_blocks_availability_mask
+        );
 
-        return BLOCK_MEMORY(free_block);
+        Block *free_block = block_free_list_get(&allocator->free_blocks[free_list_index], size);
+        if (free_block != NULL) {
+            Block *remainder_block = block_split(free_block, size);
+            if (remainder_block != NULL) {
+                heap_allocator_free_list_add(allocator, remainder_block);
+            }
+
+            free_block->size &= ~BLOCK_IS_FREE_BIT;
+            if (!BLOCK_LAST_IN_REGION(free_block)) {
+                BLOCK_NEXT(free_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
+            }
+
+            return BLOCK_MEMORY(free_block);
+        }
     }
+
+    // Resort to allocating a new region, large enough to hold a block of the requested size.
 
     isize new_region_size = isize_max(size + BLOCK_HEADER_SIZE, REGION_MIN_SIZE);
 
@@ -320,7 +403,7 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
 
     Block *remainder_block = block_split(new_block, size);
     if (remainder_block != NULL) {
-        block_free_list_add(&allocator->free_blocks, remainder_block);
+        heap_allocator_free_list_add(allocator, remainder_block);
     }
 
     new_block->size &= ~BLOCK_IS_FREE_BIT;
@@ -356,18 +439,18 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
         merged_block = previous_block;
         merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(previous_block);
         merged_block_previous_is_free_bit = previous_block->size & BLOCK_PREVIOUS_IS_FREE_BIT;
-        block_free_list_remove(&allocator->free_blocks, previous_block);
+        heap_allocator_free_list_remove(allocator, previous_block);
     }
     if (next_block != NULL) {
         merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(next_block);
         merged_block_last_in_region_bit = next_block->size & BLOCK_LAST_IN_REGION_BIT;
-        block_free_list_remove(&allocator->free_blocks, next_block);
+        heap_allocator_free_list_remove(allocator, next_block);
     }
 
     merged_block->size = merged_block_size | BLOCK_IS_FREE_BIT;
     merged_block->size |= merged_block_previous_is_free_bit;
     merged_block->size |= merged_block_last_in_region_bit;
-    block_free_list_add(&allocator->free_blocks, merged_block);
+    heap_allocator_free_list_add(allocator, merged_block);
 
     if (!BLOCK_LAST_IN_REGION(merged_block)) {
         Block *next_block_after_merged = BLOCK_NEXT(merged_block);
