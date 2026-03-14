@@ -1,17 +1,12 @@
 #include "memory.h"
 
 #include <stdint.h>
+#include <assert.h>
 
 typedef unsigned char u8;
 typedef uint64_t u64;
 typedef size_t usize;
 typedef ptrdiff_t isize;
-
-#ifdef MEMORY_LIB_ASSERT
-    #define assert(expression) MEMORY_LIB_ASSERT(expression)
-#else
-    #include <assert.h>
-#endif
 
 #define ARRAY_COUNT(array) (isize)(sizeof(array) / sizeof((array)[0]))
 
@@ -121,11 +116,11 @@ struct Region {
     Region *next;
 };
 
-typedef Region *RegionList;
-
 static inline Block *region_first_block(Region const *region) {
     return (Block *)((u8 *)region + REGION_HEADER_SIZE);
 }
+
+typedef Region *RegionList;
 
 static void region_list_prepend(RegionList *list, Region *region) {
     region->previous = NULL;
@@ -154,13 +149,11 @@ struct Block {
 // zero and thus can be used to store additional information.
 #define BLOCK_IS_FREE_BIT (usize)0x1
 #define BLOCK_PREVIOUS_IS_FREE_BIT (usize)0x2
-#define BLOCK_LAST_IN_REGION_BIT (usize)0x4
-#define BLOCK_FLAG_BITS (BLOCK_IS_FREE_BIT | BLOCK_PREVIOUS_IS_FREE_BIT | BLOCK_LAST_IN_REGION_BIT)
+#define BLOCK_FLAG_BITS (BLOCK_IS_FREE_BIT | BLOCK_PREVIOUS_IS_FREE_BIT)
 
 #define BLOCK_SIZE(block) (isize)((block)->size & ~BLOCK_FLAG_BITS)
 #define BLOCK_IS_FREE(block) (((block)->size & BLOCK_IS_FREE_BIT) != 0)
 #define BLOCK_PREVIOUS_IS_FREE(block) (((block)->size & BLOCK_PREVIOUS_IS_FREE_BIT) != 0)
-#define BLOCK_LAST_IN_REGION(block) (((block)->size & BLOCK_LAST_IN_REGION_BIT) != 0)
 
 #define BLOCK_MEMORY(block) (void *)((u8 *)(block) + BLOCK_HEADER_SIZE)
 #define BLOCK_FROM_MEMORY(memory) ((Block *)((u8 *)(memory) - BLOCK_HEADER_SIZE))
@@ -171,7 +164,7 @@ struct Block {
 #define BLOCK_PREVIOUS(block) \
     ((Block *)((u8 *)(block) - BLOCK_HEADER_SIZE - *BLOCK_PREVIOUS_SIZE(block)))
 
-// Always check for BLOCK_LAST_IN_REGION() before accessing this.
+// Next block is always accessible thanks to the zero-sized guard block at the end of each region.
 #define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
 
 #define BLOCK_PREVIOUS_FREE(block) ((Block **)((u8 *)block + BLOCK_HEADER_SIZE))
@@ -187,19 +180,16 @@ static Block *block_split(Block *block, isize new_size) {
     Block *remainder_block = (Block *)((u8 *)block + (BLOCK_HEADER_SIZE + new_size));
     remainder_block->size = remainder_block_size | BLOCK_IS_FREE_BIT;
     remainder_block->size |= (block->size & BLOCK_PREVIOUS_IS_FREE_BIT);
-    remainder_block->size |= (block->size & BLOCK_LAST_IN_REGION_BIT);
     if (BLOCK_IS_FREE(block)) {
         *BLOCK_PREVIOUS_SIZE(remainder_block) = BLOCK_SIZE(block);
     }
 
-    usize block_flags = (block->size & BLOCK_FLAG_BITS) & ~BLOCK_LAST_IN_REGION_BIT;
+    usize block_flags = (block->size & BLOCK_FLAG_BITS);
     block->size = new_size | block_flags;
-    if (!BLOCK_LAST_IN_REGION(remainder_block)) {
-        Block *next_block = BLOCK_NEXT(remainder_block);
 
-        next_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-        *BLOCK_PREVIOUS_SIZE(next_block) = BLOCK_SIZE(remainder_block);
-    }
+    Block *next_block = BLOCK_NEXT(remainder_block);
+    next_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+    *BLOCK_PREVIOUS_SIZE(next_block) = BLOCK_SIZE(remainder_block);
 
     return remainder_block;
 }
@@ -381,9 +371,7 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
             }
 
             free_block->size &= ~BLOCK_IS_FREE_BIT;
-            if (!BLOCK_LAST_IN_REGION(free_block)) {
-                BLOCK_NEXT(free_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
-            }
+            BLOCK_NEXT(free_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
 
             return BLOCK_MEMORY(free_block);
         }
@@ -439,7 +427,6 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         // Guard blocks are always marked as "in use", so that they don't get merged with neighbors.
         Block *guard_block = BLOCK_NEXT(new_block);
         guard_block->size = (usize)0;
-        guard_block->size |= BLOCK_LAST_IN_REGION_BIT;
 
         return BLOCK_MEMORY(new_block);
     }
@@ -476,7 +463,6 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     Block *guard_block = BLOCK_NEXT(new_block);
     guard_block->size = (usize)0;
     guard_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-    guard_block->size |= BLOCK_LAST_IN_REGION_BIT;
 
     Block *remainder_block = block_split(new_block, size);
     if (remainder_block != NULL) {
@@ -484,9 +470,7 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     }
 
     new_block->size &= ~BLOCK_IS_FREE_BIT;
-    if (!BLOCK_LAST_IN_REGION(new_block)) {
-        BLOCK_NEXT(new_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
-    }
+    BLOCK_NEXT(new_block)->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
 
     return BLOCK_MEMORY(new_block);
 }
@@ -503,14 +487,13 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
 
     Block *next_block = NULL;
-    if (!BLOCK_LAST_IN_REGION(block) && BLOCK_IS_FREE(BLOCK_NEXT(block))) {
+    if (BLOCK_IS_FREE(BLOCK_NEXT(block))) {
         next_block = BLOCK_NEXT(block);
     }
 
     Block *merged_block = block;
     isize merged_block_size = BLOCK_SIZE(block);
     usize merged_block_previous_is_free_bit = merged_block->size & BLOCK_PREVIOUS_IS_FREE_BIT;
-    usize merged_block_last_in_region_bit = merged_block->size & BLOCK_LAST_IN_REGION_BIT;
 
     if (previous_block != NULL) {
         merged_block = previous_block;
@@ -520,20 +503,16 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
     }
     if (next_block != NULL) {
         merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(next_block);
-        merged_block_last_in_region_bit = next_block->size & BLOCK_LAST_IN_REGION_BIT;
         heap_allocator_free_list_remove(allocator, next_block);
     }
 
     merged_block->size = merged_block_size | BLOCK_IS_FREE_BIT;
     merged_block->size |= merged_block_previous_is_free_bit;
-    merged_block->size |= merged_block_last_in_region_bit;
     heap_allocator_free_list_add(allocator, merged_block);
 
-    if (!BLOCK_LAST_IN_REGION(merged_block)) {
-        Block *next_block_after_merged = BLOCK_NEXT(merged_block);
-        next_block_after_merged->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-        *BLOCK_PREVIOUS_SIZE(next_block_after_merged) = merged_block_size;
-    }
+    Block *next_block_after_merged = BLOCK_NEXT(merged_block);
+    next_block_after_merged->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+    *BLOCK_PREVIOUS_SIZE(next_block_after_merged) = merged_block_size;
 }
 
 void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
@@ -570,21 +549,10 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
         }
     } else {
         Block *current_block = BLOCK_FROM_MEMORY(iterator->memory);
+        next_block = BLOCK_NEXT(current_block);
 
-        bool move_to_next_region;
-        if (BLOCK_LAST_IN_REGION(current_block)) {
-            move_to_next_region = true;
-        } else {
-            next_block = BLOCK_NEXT(current_block);
-            move_to_next_region = false;
-
-            // Skip over the zero-sized guard block. These occur only at the end of a region.
-            if (BLOCK_SIZE(next_block) == 0) {
-                move_to_next_region = true;
-            }
-        }
-
-        if (move_to_next_region) {
+        // Go to the next region once we reach the guard block.
+        if (BLOCK_SIZE(next_block) == 0) {
             Region *region = iterator->region;
             iterator->region = region->next;
             if (region->next != NULL) {
