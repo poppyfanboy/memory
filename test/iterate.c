@@ -3,7 +3,11 @@
 #include "test_common.c"
 
 int main(void) {
+    #ifdef USE_SYSTEM_HEAP
+    HeapAllocator *allocator = heap_allocator_from_system_heap(system_heap_grow);
+    #else
     HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
+    #endif
     assert(allocator != NULL);
 
     void *a6 = heap_allocate(allocator, 1024);

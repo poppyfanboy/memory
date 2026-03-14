@@ -7,6 +7,12 @@ typedef uint64_t u64;
 typedef size_t usize;
 typedef ptrdiff_t isize;
 
+#ifdef MEMORY_LIB_ASSERT
+    #define assert(expression) MEMORY_LIB_ASSERT(expression)
+#else
+    #include <assert.h>
+#endif
+
 #define ARRAY_COUNT(array) (isize)(sizeof(array) / sizeof((array)[0]))
 
 // This must be at least 8, because 3 lower bits of the block sizes are used for storing bit flags.
@@ -189,7 +195,10 @@ static Block *block_split(Block *block, isize new_size) {
     usize block_flags = (block->size & BLOCK_FLAG_BITS) & ~BLOCK_LAST_IN_REGION_BIT;
     block->size = new_size | block_flags;
     if (!BLOCK_LAST_IN_REGION(remainder_block)) {
-        *BLOCK_PREVIOUS_SIZE(BLOCK_NEXT(remainder_block)) = BLOCK_SIZE(remainder_block);
+        Block *next_block = BLOCK_NEXT(remainder_block);
+
+        next_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+        *BLOCK_PREVIOUS_SIZE(next_block) = BLOCK_SIZE(remainder_block);
     }
 
     return remainder_block;
@@ -380,26 +389,94 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         }
     }
 
-    // Resort to allocating a new region, large enough to hold a block of the requested size.
+    // When memory is allocated from system heap, resize an existing region (in case there is one).
 
-    isize new_region_size = isize_max(size + BLOCK_HEADER_SIZE, REGION_MIN_SIZE);
-
-    Region *new_region;
-    if (allocator->system_allocate != NULL) {
-        new_region = allocator->system_allocate(REGION_HEADER_SIZE + new_region_size);
-    } else {
-        new_region = allocator->system_heap_grow(REGION_HEADER_SIZE + new_region_size);
+    bool resize_existing_region = false;
+    if (allocator->system_allocate == NULL) {
+        assert(allocator->system_heap_grow != NULL);
+        resize_existing_region = (allocator->regions != NULL);
     }
-    if (new_region == NULL) {
+    if (resize_existing_region) {
+        Block *new_block;
+
+        // We maintain and resize a single region of memory.
+        Region *region = allocator->regions;
+
+        Block *region_guard_block = (Block *)(
+            ((u8 *)region + REGION_HEADER_SIZE + region->size) - (BLOCK_HEADER_SIZE + 0)
+        );
+
+        if (BLOCK_PREVIOUS_IS_FREE(region_guard_block)) {
+            // Try to resize an existing free block at the end of the region.
+            new_block = BLOCK_PREVIOUS(region_guard_block);
+            heap_allocator_free_list_remove(allocator, new_block);
+
+            assert(BLOCK_SIZE(new_block) < size);
+            isize heap_grow_increment = size - BLOCK_SIZE(new_block);
+
+            void *heap_grow_result = allocator->system_heap_grow(heap_grow_increment);
+            if (heap_grow_result == NULL) {
+                return NULL;
+            }
+            region->size += heap_grow_increment;
+
+            usize new_block_flags = (new_block->size & BLOCK_FLAG_BITS) & ~BLOCK_IS_FREE_BIT;
+            new_block->size = (usize)size | new_block_flags;
+        } else {
+            // Allocate a new block.
+            isize heap_grow_increment = BLOCK_HEADER_SIZE + size;
+
+            void *heap_grow_result = allocator->system_heap_grow(heap_grow_increment);
+            if (heap_grow_result == NULL) {
+                return NULL;
+            }
+            region->size += heap_grow_increment;
+
+            new_block = region_guard_block;
+            new_block->size = (usize)size;
+        }
+
+        // Guard blocks are always marked as "in use", so that they don't get merged with neighbors.
+        Block *guard_block = BLOCK_NEXT(new_block);
+        guard_block->size = (usize)0;
+        guard_block->size |= BLOCK_LAST_IN_REGION_BIT;
+
+        return BLOCK_MEMORY(new_block);
+    }
+
+    // Resort to allocating a new region to fit a block of the requested size.
+
+    // Additionally make space for the zero-sized "guard" block placed at the end of the new region.
+    isize new_region_size = (BLOCK_HEADER_SIZE + size) + (BLOCK_HEADER_SIZE + 0);
+    if (new_region_size < REGION_MIN_SIZE) {
+        new_region_size = REGION_MIN_SIZE;
+    }
+
+    isize new_block_size = new_region_size - BLOCK_HEADER_SIZE - (BLOCK_HEADER_SIZE + 0);
+    assert(new_block_size >= size);
+
+    void *new_region_memory;
+    if (allocator->system_allocate != NULL) {
+        new_region_memory = allocator->system_allocate(REGION_HEADER_SIZE + new_region_size);
+    } else {
+        new_region_memory = allocator->system_heap_grow(REGION_HEADER_SIZE + new_region_size);
+    }
+    if (new_region_memory == NULL) {
         return NULL;
     }
 
+    Region *new_region = new_region_memory;
     new_region->size = new_region_size;
     region_list_prepend(&allocator->regions, new_region);
 
+    // No need to set BLOCK_PREVIOUS_SIZE() here, because this block will get used immediately.
     Block *new_block = region_first_block(new_region);
-    new_block->size = (new_region_size - BLOCK_HEADER_SIZE) | BLOCK_IS_FREE_BIT;
-    new_block->size |= BLOCK_LAST_IN_REGION_BIT;
+    new_block->size = (usize)new_block_size | BLOCK_IS_FREE_BIT;
+
+    Block *guard_block = BLOCK_NEXT(new_block);
+    guard_block->size = (usize)0;
+    guard_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+    guard_block->size |= BLOCK_LAST_IN_REGION_BIT;
 
     Block *remainder_block = block_split(new_block, size);
     if (remainder_block != NULL) {
@@ -494,13 +571,26 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
     } else {
         Block *current_block = BLOCK_FROM_MEMORY(iterator->memory);
 
-        if (!BLOCK_LAST_IN_REGION(current_block)) {
-            next_block = BLOCK_NEXT(current_block);
+        bool move_to_next_region;
+        if (BLOCK_LAST_IN_REGION(current_block)) {
+            move_to_next_region = true;
         } else {
+            next_block = BLOCK_NEXT(current_block);
+            move_to_next_region = false;
+
+            // Skip over the zero-sized guard block. These occur only at the end of a region.
+            if (BLOCK_SIZE(next_block) == 0) {
+                move_to_next_region = true;
+            }
+        }
+
+        if (move_to_next_region) {
             Region *region = iterator->region;
             iterator->region = region->next;
             if (region->next != NULL) {
                 next_block = region_first_block(region->next);
+            } else {
+                next_block = NULL;
             }
         }
     }

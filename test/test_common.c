@@ -1,17 +1,81 @@
 #include <stdint.h>
 #include <stdio.h>
 
+typedef unsigned char u8;
+typedef ptrdiff_t isize;
+typedef size_t usize;
+
+#define SYSTEM_HEAP_CAPACITY ((isize)64 * 1024 * 1024 * 1024)
+
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-void *system_allocate(ptrdiff_t size) {
+void *system_allocate(isize size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
 void system_deallocate(void *memory) {
     VirtualFree(memory, 0, MEM_RELEASE);
+}
+
+typedef struct {
+    void *base;
+    isize allocated;
+    isize committed;
+    isize reserved;
+} SystemHeap;
+
+SystemHeap system_heap = {0};
+usize page_size = 0;
+
+void *system_heap_grow(isize increment) {
+    if (system_heap.base == NULL) {
+        void *heap_base = VirtualAlloc(NULL, SYSTEM_HEAP_CAPACITY, MEM_RESERVE, PAGE_READWRITE);
+        if (heap_base == NULL) {
+            return NULL;
+        }
+
+        system_heap.base = heap_base;
+        system_heap.allocated = 0;
+        system_heap.committed = 0;
+        system_heap.reserved = SYSTEM_HEAP_CAPACITY;
+
+        SYSTEM_INFO system_info;
+        GetSystemInfo(&system_info);
+        page_size = system_info.dwPageSize;
+    }
+
+    if (increment == 0) {
+        return system_heap.base;
+    }
+
+    if (system_heap.allocated + increment > system_heap.reserved) {
+        return NULL;
+    }
+
+    isize bytes_to_commit = (system_heap.allocated + increment) - system_heap.committed;
+    if (bytes_to_commit > 0) {
+        bytes_to_commit = (bytes_to_commit + page_size - 1) / page_size * page_size;
+
+        void *commit_result = VirtualAlloc(
+            (u8 *)system_heap.base + system_heap.committed,
+            bytes_to_commit,
+            MEM_COMMIT,
+            PAGE_READWRITE
+        );
+        if (commit_result == NULL) {
+            return NULL;
+        }
+
+        system_heap.committed += bytes_to_commit;
+    }
+
+    void *memory = (u8 *)system_heap.base + system_heap.allocated;
+    system_heap.allocated += increment;
+
+    return memory;
 }
 
 #endif // _WIN32

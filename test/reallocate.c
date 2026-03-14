@@ -2,7 +2,7 @@
 
 #include "test_common.c"
 
-#define COUNT 25000
+#define COUNT 200000
 
 typedef struct {
     int *values;
@@ -29,7 +29,11 @@ void array_push(Array *array, int value, HeapAllocator *allocator) {
 }
 
 int main(void) {
+    #ifdef USE_SYSTEM_HEAP
+    HeapAllocator *allocator = heap_allocator_from_system_heap(system_heap_grow);
+    #else
     HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
+    #endif
     assert(allocator != NULL);
 
     Array array = {0};
