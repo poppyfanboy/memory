@@ -56,11 +56,7 @@ int main(void) {
     PCG32 rng;
     pcg32_initialize(&rng, 42);
 
-    #ifdef USE_SYSTEM_HEAP
-    HeapAllocator *allocator = heap_allocator_from_system_heap(system_heap_grow);
-    #else
-    HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
-    #endif
+    HeapAllocator *allocator = heap_allocator();
     assert(allocator != NULL);
 
     String *strings = heap_allocate(allocator, STRING_COUNT * sizeof(String));

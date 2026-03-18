@@ -103,6 +103,14 @@ uint32_t pcg32_random(PCG32 *rng) {
 
 #include "../src/memory.h"
 
+HeapAllocator *heap_allocator(void) {
+    #ifdef USE_SYSTEM_HEAP
+    return heap_allocator_from_system_heap(system_heap_grow);
+    #else
+    return heap_allocator_create(system_allocate, system_deallocate);
+    #endif
+}
+
 void heap_dump(HeapAllocator const *allocator) {
     HeapIterator iterator = {0};
     heap_iterate(allocator, &iterator);

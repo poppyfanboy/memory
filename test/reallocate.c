@@ -1,59 +1,43 @@
 #include <assert.h>
-
 #include "test_common.c"
 
-#define COUNT 200000
-
-typedef struct {
-    int *values;
-    int count;
-    int capacity;
-} Array;
-
-void array_push(Array *array, int value, HeapAllocator *allocator) {
-    if (array->count == array->capacity) {
-        int new_capacity = array->capacity > 0 ? 3 * array->capacity / 2 : 16;
-
-        array->values = heap_reallocate(
-            allocator,
-            array->values,
-            new_capacity * sizeof(*array->values)
-        );
-        assert(array->values != NULL);
-
-        array->capacity = new_capacity;
-    }
-
-    array->values[array->count] = value;
-    array->count += 1;
-}
-
 int main(void) {
-    #ifdef USE_SYSTEM_HEAP
-    HeapAllocator *allocator = heap_allocator_from_system_heap(system_heap_grow);
-    #else
-    HeapAllocator *allocator = heap_allocator_create(system_allocate, system_deallocate);
-    #endif
-    assert(allocator != NULL);
+    HeapAllocator *allocator = heap_allocator();
 
-    Array array = {0};
-    for (int i = 0; i < COUNT; i += 1) {
-        array_push(&array, i, allocator);
-    }
+    void *first = heap_allocate(allocator, 256);
+    assert(first != NULL);
 
     heap_dump(allocator);
+    printf("\n");
 
-    for (int i = 0; i < array.count; i += 1) {
-        assert(array.values[i] == i);
-    }
+    void *second = heap_allocate(allocator, 261776);
+    assert(second != NULL);
 
-    array.values = heap_reallocate(allocator, array.values, 1 * sizeof(*array.values));
-    array.capacity = 1;
-    array.count = 1;
-    assert(array.values[0] == 0);
+    // Now the "second" block is placed between the two free ones.
+    // The one to the right is not large enough to satisfy the reallocation request.
+    heap_deallocate(allocator, first);
 
-    array.values = heap_reallocate(allocator, array.values, 0);
-    assert(array.values == NULL);
+    heap_dump(allocator);
+    printf("\n");
+
+    second = heap_reallocate(allocator, second, 261776 + 256);
+    assert(second != NULL);
+
+    printf("=== After heap_reallocate(%d) ===\n", 261776 + 256);
+    heap_dump(allocator);
+    printf("\n");
+
+    second = heap_reallocate(allocator, second, 256);
+
+    printf("=== After heap_reallocate(%d) ===\n", 256);
+    heap_dump(allocator);
+    printf("\n");
+
+    second = heap_reallocate(allocator, second, 512 * 1024);
+
+    printf("=== After heap_reallocate(%d) ===\n", 512 * 1024);
+    heap_dump(allocator);
+    printf("\n");
 
     heap_allocator_destroy(allocator);
     return 0;
