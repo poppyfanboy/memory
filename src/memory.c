@@ -16,8 +16,14 @@ typedef ptrdiff_t isize;
 #define ALIGN_UP(value, alignment) (((usize)(value) + (alignment) - 1) & (~(usize)(alignment) + 1))
 #define ALIGN_DOWN(value, alignment) ((usize)(value) & (~(usize)(alignment) + 1))
 
+#if defined(__clang__) || defined(__GNUC__)
+    #define u64_trailing_zeroes __builtin_ctzll
+#else
+    #define u64_trailing_zeroes u64_trailing_zeroes_manual
+#endif
+
 // https://graphics.stanford.edu/~seander/bithacks.html#ZerosOnRightParallel
-static inline int u64_trailing_zeroes(u64 value) {
+static inline int u64_trailing_zeroes_manual(u64 value) {
     if (value == 0) {
         return 64;
     }
@@ -27,24 +33,12 @@ static inline int u64_trailing_zeroes(u64 value) {
 
     // Determine which half has the set bit, then determine which quarter has the bit, and so on.
     int trailing_zeroes = 63;
-    if ((value & 0x00000000ffffffff) != 0) {
-        trailing_zeroes -= 32;
-    }
-    if ((value & 0x0000ffff0000ffff) != 0) {
-        trailing_zeroes -= 16;
-    }
-    if ((value & 0x00ff00ff00ff00ff) != 0) {
-        trailing_zeroes -= 8;
-    }
-    if ((value & 0x0f0f0f0f0f0f0f0f) != 0) {
-        trailing_zeroes -= 4;
-    }
-    if ((value & 0x3333333333333333) != 0) {
-        trailing_zeroes -= 2;
-    }
-    if ((value & 0x5555555555555555) != 0) {
-        trailing_zeroes -= 1;
-    }
+    if ((value & 0x00000000ffffffff) != 0) trailing_zeroes -= 32;
+    if ((value & 0x0000ffff0000ffff) != 0) trailing_zeroes -= 16;
+    if ((value & 0x00ff00ff00ff00ff) != 0) trailing_zeroes -= 8;
+    if ((value & 0x0f0f0f0f0f0f0f0f) != 0) trailing_zeroes -= 4;
+    if ((value & 0x3333333333333333) != 0) trailing_zeroes -= 2;
+    if ((value & 0x5555555555555555) != 0) trailing_zeroes -= 1;
 
     return trailing_zeroes;
 }
@@ -114,11 +108,11 @@ struct Region {
 };
 
 #define REGION_HEADER_SIZE (isize)ALIGN_UP(sizeof(Region), ALIGNMENT)
-
 #define REGION_MIN_SIZE ((isize)256 * 1024)
 
-#define REGION_FIRST_BLOCK(region) \
-    ((Block *)((u8 *)(region) + REGION_HEADER_SIZE))
+#define REGION_FIRST_BLOCK(region) ((Block *)((u8 *)(region) + REGION_HEADER_SIZE))
+
+// A special zero-sized block which is always marked as "in-use". Placed at the end of each region.
 #define REGION_GUARD_BLOCK(region) \
     ((Block *)((u8 *)(region) + (REGION_HEADER_SIZE + (region)->size) - (BLOCK_HEADER_SIZE + 0)))
 
@@ -366,92 +360,68 @@ static inline void heap_allocator_free_list_remove(HeapAllocator *allocator, Blo
     }
 }
 
-void *heap_allocate(HeapAllocator *allocator, isize size) {
-    if (size == 0) {
+// Allocates a raw piece of memory at the end of the region by growing the system heap.
+// You are expected to create a Block inside of it yourself.
+static void *heap_allocate_raw_from_region(HeapAllocator *allocator, Region *region, isize size) {
+    assert(allocator->system_heap_grow != NULL);
+    assert(size > 0 && size % ALIGNMENT == 0);
+
+    Block *block = REGION_GUARD_BLOCK(region);
+    isize heap_grow_increment = size;
+    if (BLOCK_PREVIOUS_IS_FREE(block)) {
+        // Use up the whole free block at the end of the region for simplicity sake.
+        //
+        // (It's expected from the user that they've already checked if they could've used some free
+        // block to satisfy the request without asking for more memory from the system.)
+        block = BLOCK_PREVIOUS(block);
+        heap_grow_increment = isize_max(size - (BLOCK_HEADER_SIZE + BLOCK_SIZE(block)), 0);
+    }
+
+    void *heap_grow_result = allocator->system_heap_grow(heap_grow_increment);
+    if (heap_grow_result == NULL) {
+        return NULL;
+    }
+    region->size += heap_grow_increment;
+
+    if (BLOCK_IS_FREE(block)) {
+        heap_allocator_free_list_remove(allocator, block);
+        block_mark_as_in_use(block);
+    }
+    Block *region_guard_block = REGION_GUARD_BLOCK(region);
+    region_guard_block->size = 0;
+
+    return block;
+}
+
+static void *heap_allocate_from_free_list(HeapAllocator *allocator, isize size) {
+    if (allocator->free_blocks_availability == 0) {
         return NULL;
     }
 
-    size = isize_max(size, BLOCK_MIN_SIZE);
-    size = ALIGN_UP(size, ALIGNMENT);
-
-    // Try to take a block from one of the free lists.
-
     isize free_list_min_index = heap_allocator_free_list_index(allocator, size);
     u64 free_blocks_availability_mask = ~(((u64)1 << free_list_min_index) - 1);
-    if ((allocator->free_blocks_availability & free_blocks_availability_mask) != 0) {
-        int free_list_index = u64_trailing_zeroes(
-            allocator->free_blocks_availability & free_blocks_availability_mask
-        );
-
-        Block *free_block = block_free_list_get(&allocator->free_blocks[free_list_index], size);
-        if (free_block != NULL) {
-            Block *remainder_block = block_split(free_block, size);
-            if (remainder_block != NULL) {
-                heap_allocator_free_list_add(allocator, remainder_block);
-            }
-
-            block_mark_as_in_use(free_block);
-            return BLOCK_MEMORY(free_block);
-        }
+    if ((allocator->free_blocks_availability & free_blocks_availability_mask) == 0) {
+        return NULL;
     }
 
-    // When memory is allocated from system heap, resize an existing region (in case there is one).
-
-    bool resize_existing_region = false;
-    if (allocator->system_allocate == NULL) {
-        assert(allocator->system_heap_grow != NULL);
-        resize_existing_region = allocator->regions != NULL;
-    }
-    if (resize_existing_region) {
-        Block *new_block;
-
-        // We maintain and resize a single region of memory, when "system_allocate" is unavailable.
-        Region *region = allocator->regions;
-        Block *region_guard_block = REGION_GUARD_BLOCK(region);
-
-        if (BLOCK_PREVIOUS_IS_FREE(region_guard_block)) {
-            // Try to resize an existing free block at the end of the region.
-            new_block = BLOCK_PREVIOUS(region_guard_block);
-            heap_allocator_free_list_remove(allocator, new_block);
-
-            assert(BLOCK_SIZE(new_block) < size);
-            isize heap_grow_increment = size - BLOCK_SIZE(new_block);
-
-            void *heap_grow_result = allocator->system_heap_grow(heap_grow_increment);
-            if (heap_grow_result == NULL) {
-                return NULL;
-            }
-
-            region->size += heap_grow_increment;
-            region_guard_block = REGION_GUARD_BLOCK(region);
-            region_guard_block->size = 0;
-
-            block_set_size(new_block, size);
-            block_mark_as_in_use(new_block);
-        } else {
-            // Append a new block at the end of the region.
-            new_block = region_guard_block;
-
-            isize heap_grow_increment = BLOCK_HEADER_SIZE + size;
-
-            void *heap_grow_result = allocator->system_heap_grow(heap_grow_increment);
-            if (heap_grow_result == NULL) {
-                return NULL;
-            }
-
-            region->size += heap_grow_increment;
-            region_guard_block = REGION_GUARD_BLOCK(region);
-            region_guard_block->size = 0;
-
-            new_block->size = (usize)size;
-            block_mark_as_in_use(new_block);
-        }
-
-        return BLOCK_MEMORY(new_block);
+    int free_list_index = u64_trailing_zeroes(
+        allocator->free_blocks_availability & free_blocks_availability_mask
+    );
+    Block *free_block = block_free_list_get(&allocator->free_blocks[free_list_index], size);
+    if (free_block == NULL) {
+        return NULL;
     }
 
-    // Resort to allocating a new region to fit a block of the requested size.
+    Block *remainder_block = block_split(free_block, size);
+    if (remainder_block != NULL) {
+        heap_allocator_free_list_add(allocator, remainder_block);
+    }
 
+    block_mark_as_in_use(free_block);
+    return BLOCK_MEMORY(free_block);
+}
+
+static void *heap_allocate_from_new_region(HeapAllocator *allocator, isize size) {
     // Additionally make space for the zero-sized "guard" block placed at the end of the new region.
     isize new_region_size = (BLOCK_HEADER_SIZE + size) + (BLOCK_HEADER_SIZE + 0);
     if (new_region_size < REGION_MIN_SIZE) {
@@ -489,6 +459,49 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
 
     block_mark_as_in_use(new_block);
     return BLOCK_MEMORY(new_block);
+}
+
+void *heap_allocate(HeapAllocator *allocator, isize size) {
+    if (size == 0) {
+        return NULL;
+    }
+
+    size = isize_max(size, BLOCK_MIN_SIZE);
+    size = ALIGN_UP(size, ALIGNMENT);
+
+    // Try to take a block from one of the free lists.
+
+    void *memory_from_free_list = heap_allocate_from_free_list(allocator, size);
+    if (memory_from_free_list != NULL) {
+        return memory_from_free_list;
+    }
+
+    // When memory is allocated from system heap, resize an existing region (in case there is one).
+
+    bool resize_existing_region = false;
+    if (allocator->system_allocate == NULL) {
+        resize_existing_region = allocator->regions != NULL;
+    }
+
+    if (resize_existing_region) {
+        Region *region = allocator->regions;
+
+        u8 *raw_memory = heap_allocate_raw_from_region(allocator, region, BLOCK_HEADER_SIZE + size);
+        if (raw_memory == NULL) {
+            return NULL;
+        }
+        isize raw_memory_size = (u8 *)REGION_GUARD_BLOCK(region) - raw_memory;
+
+        Block *new_block = (Block *)raw_memory;
+        new_block->size = raw_memory_size - BLOCK_HEADER_SIZE;
+        block_mark_as_in_use(new_block);
+
+        return BLOCK_MEMORY(new_block);
+    }
+
+    // Resort to allocating a new region to fit a block of the requested size.
+
+    return heap_allocate_from_new_region(allocator, size);
 }
 
 void heap_deallocate(HeapAllocator *allocator, void *memory) {
@@ -557,7 +570,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
             heap_allocator_free_list_add(allocator, remainder_block);
         }
 
-        return memory;
+        return BLOCK_MEMORY(block);
     }
 
     // Try to take memory from the next block.
@@ -569,28 +582,17 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
         if (old_size + max_growth_amount >= new_size) {
             heap_allocator_free_list_remove(allocator, next_block);
 
-            isize growth_amount = new_size - old_size;
+            Block *merged_block = block;
+            block_set_size(merged_block, old_size + max_growth_amount);
+            block_mark_as_in_use(merged_block);
 
-            if (BLOCK_SIZE(next_block) - growth_amount < BLOCK_MIN_SIZE) {
-                // Completely eliminate the next block.
-                growth_amount = max_growth_amount;
-            } else {
-                // Resize the next block and add it back to the free-list.
-                isize remainder_block_size = BLOCK_SIZE(next_block) - growth_amount;
-
-                Block *remainder_block = (Block *)(
-                    (u8 *)block + BLOCK_HEADER_SIZE + (old_size + growth_amount)
-                );
-                remainder_block->size = remainder_block_size;
-                block_mark_as_free(remainder_block);
-
+            // Trim the merged block.
+            Block *remainder_block = block_split(merged_block, new_size);
+            if (remainder_block != NULL) {
                 heap_allocator_free_list_add(allocator, remainder_block);
             }
 
-            block_set_size(block, old_size + growth_amount);
-            block_mark_as_in_use(block);
-
-            return BLOCK_MEMORY(block);
+            return BLOCK_MEMORY(merged_block);
         }
     }
 
@@ -633,7 +635,46 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
     // Resort to copying memory over to completely separate block.
 
-    void *new_memory = heap_allocate(allocator, new_size);
+    // Try to get away without having to ask system for more memory.
+
+    void *new_memory = heap_allocate_from_free_list(allocator, new_size);
+    if (new_memory != NULL) {
+        memory_copy(memory, old_size, new_memory);
+        heap_deallocate(allocator, memory);
+        return new_memory;
+    }
+
+    // When using system heap, try to resize the block at the cost of growing the heap.
+
+    if (allocator->system_allocate == NULL) {
+        bool block_is_last_non_free_within_region;
+        {
+            Block *next_block = BLOCK_NEXT(block);
+            block_is_last_non_free_within_region =
+                BLOCK_SIZE(next_block) == 0 ||
+                BLOCK_IS_FREE(next_block) && BLOCK_SIZE(BLOCK_NEXT(next_block)) == 0;
+        }
+
+        if (block_is_last_non_free_within_region) {
+            Region *region = allocator->regions;
+
+            u8 *raw_memory = heap_allocate_raw_from_region(allocator, region, new_size - old_size);
+            if (raw_memory == NULL) {
+                return NULL;
+            }
+            isize raw_memory_size = (u8 *)REGION_GUARD_BLOCK(region) - raw_memory;
+
+            assert((void *)BLOCK_NEXT(block) == (void *)raw_memory);
+            block_set_size(block, BLOCK_SIZE(block) + raw_memory_size);
+            block_mark_as_in_use(block);
+
+            return BLOCK_MEMORY(block);
+        }
+    }
+
+    // Fallback to "allocate + copy + deallocate".
+
+    new_memory = heap_allocate(allocator, new_size);
     if (new_memory == NULL) {
         return NULL;
     }
