@@ -10,7 +10,7 @@ int main(void) {
     heap_dump(allocator);
     printf("\n");
 
-    void *second = heap_allocate(allocator, 261776);
+    void *second = heap_allocate(allocator, 260992);
     assert(second != NULL);
 
     // Now the "second" block is placed between the two free ones.
@@ -20,22 +20,22 @@ int main(void) {
     heap_dump(allocator);
     printf("\n");
 
-    second = heap_reallocate(allocator, second, 261776 + 256);
+    second = heap_reallocate(allocator, second, 260992 + 256);
     assert(second != NULL);
 
-    printf("=== After heap_reallocate(%d) ===\n", 261776 + 256);
+    printf("After heap_reallocate(%d)\n", 260992 + 256);
     heap_dump(allocator);
     printf("\n");
 
     second = heap_reallocate(allocator, second, 256);
 
-    printf("=== After heap_reallocate(%d) ===\n", 256);
+    printf("After heap_reallocate(%d)\n", 256);
     heap_dump(allocator);
     printf("\n");
 
-    second = heap_reallocate(allocator, second, 512 * 1024);
+    second = heap_reallocate(allocator, second, 510 * 1024);
 
-    printf("=== After heap_reallocate(%d) ===\n", 512 * 1024);
+    printf("After heap_reallocate(%d)\n", 510 * 1024);
     heap_dump(allocator);
     printf("\n");
 

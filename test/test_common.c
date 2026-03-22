@@ -116,12 +116,20 @@ void heap_dump(HeapAllocator const *allocator) {
     heap_iterate(allocator, &iterator);
 
     while (iterator.memory != NULL) {
-        printf(
-            "%s block of size %td at address 0x%p\n",
-            iterator.is_free ? "Free" : "Occupied",
-            iterator.size,
-            iterator.memory
-        );
+        if (iterator.memory == allocator) {
+            printf(
+                "[0x%p] %9td bytes: Allocator metadata\n",
+                iterator.memory,
+                iterator.size
+            );
+        } else {
+            printf(
+                "[0x%p] %9td bytes: %s block\n",
+                iterator.memory,
+                iterator.size,
+                iterator.is_free ? "Free" : "Occupied"
+            );
+        }
 
         heap_iterate(allocator, &iterator);
     }
