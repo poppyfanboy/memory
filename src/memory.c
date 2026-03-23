@@ -241,6 +241,50 @@ static Block *block_list_get(BlockList *list, isize min_size) {
     }
 }
 
+typedef enum {
+    TREE_NODE_BLACK,
+    TREE_NODE_RED,
+} TreeNodeColor;
+
+typedef struct TreeNode TreeNode;
+
+struct TreeNode {
+    TreeNodeColor color;
+    TreeNode *parent;
+    TreeNode *left;
+    TreeNode *right;
+};
+
+#define BLOCK_TREE_NODE(block) ((TreeNode *)BLOCK_MEMORY(block))
+#define BLOCK_FROM_TREE_NODE(node) ((Block *)BLOCK_FROM_MEMORY(node))
+
+#define TREE_NODE_KEY(node) BLOCK_SIZE(BLOCK_FROM_TREE_NODE(node))
+
+// A red-black tree as it is described in "Introduction to Algorithms" book (a.k.a. CLRS).
+typedef struct {
+    TreeNode *null;
+    TreeNode *root;
+} Tree;
+
+static void tree_insert(Tree *tree, TreeNode *node);
+static void tree_delete(Tree *tree, TreeNode *node);
+
+static TreeNode *tree_lower_bound_search(Tree const *tree, isize min_key) {
+    TreeNode *result = NULL;
+
+    TreeNode *node_iter = tree->root;
+    while (node_iter != tree->null) {
+        if (TREE_NODE_KEY(node_iter) >= min_key) {
+            result = node_iter;
+            node_iter = node_iter->left;
+        } else {
+            node_iter = node_iter->right;
+        }
+    }
+
+    return result;
+}
+
 struct Region {
     // Size of the memory available inside of the region (i.e. header size is not included).
     isize size;
@@ -299,6 +343,8 @@ struct HeapAllocator {
     u64 free_blocks_availability;
     BlockList free_blocks[64];
 
+    Tree free_block_tree;
+
     SystemMemoryFunctions system;
 };
 
@@ -324,8 +370,16 @@ static HeapAllocator *heap_allocator_bootstrap(
     memory_iter += ALIGN_UP(sizeof(HeapAllocator), ALIGNMENT);
     assert(memory_iter <= memory_end);
 
+    TreeNode *tree_null_node = (TreeNode *)memory_iter;
+    memory_iter += ALIGN_UP(sizeof(TreeNode), ALIGNMENT);
+    assert(memory_iter <= memory_end);
+
     memory_set(allocator, sizeof(HeapAllocator), 0);
     region_list_prepend(&allocator->regions, initial_region);
+
+    tree_null_node->color = TREE_NODE_BLACK;
+    allocator->free_block_tree.null = tree_null_node;
+    allocator->free_block_tree.root = tree_null_node;
 
     allocator->system.allocate = system->allocate;
     allocator->system.deallocate = system->deallocate;
@@ -385,30 +439,43 @@ void heap_allocator_destroy(HeapAllocator *allocator) {
     }
 }
 
-static inline isize heap_allocator_free_list_index(HeapAllocator const *allocator, isize size) {
+// Returns ARRAY_COUNT(...) index in case the size is too large for any of fixed-sized free lists.
+static isize heap_allocator_free_list_index(HeapAllocator const *allocator, isize size) {
+    // We "downplay" the size of a free block, so that an allocation of the corresponding size would
+    // definitely fit inside of the block.
     size = ALIGN_DOWN(size, ALIGNMENT);
+
     isize min_size = ALIGN_UP(BLOCK_MIN_SIZE, ALIGNMENT);
+    assert(size >= min_size);
 
     isize list_index = isize_min(
         (size - min_size) / ALIGNMENT,
-        ARRAY_COUNT(allocator->free_blocks) - 1
+        ARRAY_COUNT(allocator->free_blocks)
     );
     return list_index;
 }
 
-static inline void heap_allocator_free_list_add(HeapAllocator *allocator, Block *block) {
+static void heap_allocator_free_list_add(HeapAllocator *allocator, Block *block) {
     isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
-    block_list_add(&allocator->free_blocks[list_index], block);
 
-    allocator->free_blocks_availability |= (u64)1 << list_index;
+    if (list_index < ARRAY_COUNT(allocator->free_blocks)) {
+        block_list_add(&allocator->free_blocks[list_index], block);
+        allocator->free_blocks_availability |= (u64)1 << list_index;
+    } else {
+        tree_insert(&allocator->free_block_tree, BLOCK_TREE_NODE(block));
+    }
 }
 
-static inline void heap_allocator_free_list_remove(HeapAllocator *allocator, Block *block) {
+static void heap_allocator_free_list_remove(HeapAllocator *allocator, Block *block) {
     isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
-    block_list_remove(&allocator->free_blocks[list_index], block);
 
-    if (allocator->free_blocks[list_index] == NULL) {
-        allocator->free_blocks_availability &= ~((u64)1 << list_index);
+    if (list_index < ARRAY_COUNT(allocator->free_blocks)) {
+        block_list_remove(&allocator->free_blocks[list_index], block);
+        if (allocator->free_blocks[list_index] == NULL) {
+            allocator->free_blocks_availability &= ~((u64)1 << list_index);
+        }
+    } else {
+        tree_delete(&allocator->free_block_tree, BLOCK_TREE_NODE(block));
     }
 }
 
@@ -446,31 +513,44 @@ static void *heap_allocate_raw_from_region(HeapAllocator *allocator, Region *reg
 }
 
 static void *heap_allocate_from_free_list(HeapAllocator *allocator, isize size) {
-    if (allocator->free_blocks_availability == 0) {
-        return NULL;
-    }
+    Block *free_block = NULL;
 
+    // Try to find a free block in one of the fixed-size free lists.
     isize free_list_min_index = heap_allocator_free_list_index(allocator, size);
-    u64 free_blocks_availability_mask = ~(((u64)1 << free_list_min_index) - 1);
-    if ((allocator->free_blocks_availability & free_blocks_availability_mask) == 0) {
-        return NULL;
+    if (free_list_min_index < ARRAY_COUNT(allocator->free_blocks)) {
+        u64 free_blocks_availability_mask = ~(((u64)1 << free_list_min_index) - 1);
+
+        if ((allocator->free_blocks_availability & free_blocks_availability_mask) != 0) {
+            int free_list_index = u64_trailing_zeroes(
+                allocator->free_blocks_availability & free_blocks_availability_mask
+            );
+            free_block = block_list_get(&allocator->free_blocks[free_list_index], size);
+        }
     }
 
-    int free_list_index = u64_trailing_zeroes(
-        allocator->free_blocks_availability & free_blocks_availability_mask
-    );
-    Block *free_block = block_list_get(&allocator->free_blocks[free_list_index], size);
+    // Fallback to searching in the tree.
     if (free_block == NULL) {
+        TreeNode *free_block_node = tree_lower_bound_search(&allocator->free_block_tree, size);
+        if (free_block_node != NULL) {
+            tree_delete(&allocator->free_block_tree, free_block_node);
+            free_block = BLOCK_FROM_TREE_NODE(free_block_node);
+        }
+    }
+
+    if (free_block != NULL) {
+        Block *remainder_block = block_split(free_block, size);
+        if (remainder_block != NULL) {
+            heap_allocator_free_list_add(allocator, remainder_block);
+        }
+
+        block_mark_as_in_use(free_block);
+    }
+
+    if (free_block != NULL) {
+        return BLOCK_MEMORY(free_block);
+    } else {
         return NULL;
     }
-
-    Block *remainder_block = block_split(free_block, size);
-    if (remainder_block != NULL) {
-        heap_allocator_free_list_add(allocator, remainder_block);
-    }
-
-    block_mark_as_in_use(free_block);
-    return BLOCK_MEMORY(free_block);
 }
 
 static void *heap_allocate_from_new_region(HeapAllocator *allocator, isize size) {
@@ -759,5 +839,211 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
     } else {
         iterator->memory = NULL;
         iterator->size = 0;
+    }
+}
+
+// Operations on red-black trees. Direct translation from pseudocode presented in CLRS.
+
+static void tree_left_rotate(Tree *tree, TreeNode *x) {
+    TreeNode *y = x->right;
+    x->right = y->left;
+    if (y->left != tree->null) {
+        y->left->parent = x;
+    }
+    y->parent = x->parent;
+    if (x->parent == tree->null) {
+        tree->root = y;
+    } else if (x == x->parent->left) {
+        x->parent->left = y;
+    } else {
+        x->parent->right = y;
+    }
+    y->left = x;
+    x->parent = y;
+}
+
+static void tree_right_rotate(Tree *tree, TreeNode *x) {
+    TreeNode *y = x->left;
+    x->left = y->right;
+    if (y->right != tree->null) {
+        y->right->parent = x;
+    }
+    y->parent = x->parent;
+    if (x->parent == tree->null) {
+        tree->root = y;
+    } else if (x == x->parent->right) {
+        x->parent->right = y;
+    } else {
+        x->parent->left = y;
+    }
+    y->right = x;
+    x->parent = y;
+}
+
+static void tree_insert_fixup(Tree *tree, TreeNode *z) {
+    while (z->parent->color == TREE_NODE_RED) {
+        if (z->parent == z->parent->parent->left) {
+            TreeNode *y = z->parent->parent->right;
+            if (y->color == TREE_NODE_RED) {
+                z->parent->color = TREE_NODE_BLACK;
+                y->color = TREE_NODE_BLACK;
+                z->parent->parent->color = TREE_NODE_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->right) {
+                    z = z->parent;
+                    tree_left_rotate(tree, z);
+                }
+                z->parent->color = TREE_NODE_BLACK;
+                z->parent->parent->color = TREE_NODE_RED;
+                tree_right_rotate(tree, z->parent->parent);
+            }
+        } else {
+            TreeNode *y = z->parent->parent->left;
+            if (y->color == TREE_NODE_RED) {
+                z->parent->color = TREE_NODE_BLACK;
+                y->color = TREE_NODE_BLACK;
+                z->parent->parent->color = TREE_NODE_RED;
+                z = z->parent->parent;
+            } else {
+                if (z == z->parent->left) {
+                    z = z->parent;
+                    tree_right_rotate(tree, z);
+                }
+                z->parent->color = TREE_NODE_BLACK;
+                z->parent->parent->color = TREE_NODE_RED;
+                tree_left_rotate(tree, z->parent->parent);
+            }
+        }
+    }
+    tree->root->color = TREE_NODE_BLACK;
+}
+
+static void tree_insert(Tree *tree, TreeNode *z) {
+    TreeNode *x = tree->root;
+    TreeNode *y = tree->null;
+    while (x != tree->null) {
+        y = x;
+        if (TREE_NODE_KEY(z) < TREE_NODE_KEY(x)) {
+            x = x->left;
+        } else {
+            x = x->right;
+        }
+    }
+    z->parent = y;
+    if (y == tree->null) {
+        tree->root = z;
+    } else if (TREE_NODE_KEY(z) < TREE_NODE_KEY(y)) {
+        y->left = z;
+    } else {
+        y->right = z;
+    }
+    z->left = tree->null;
+    z->right = tree->null;
+    z->color = TREE_NODE_RED;
+    tree_insert_fixup(tree, z);
+}
+
+static TreeNode *tree_minimum(Tree *tree, TreeNode *node) {
+    while (node->left != tree->null) {
+        node = node->left;
+    }
+    return node;
+}
+
+static void tree_node_transplant(Tree *tree, TreeNode *u, TreeNode *v) {
+    if (u->parent == tree->null) {
+        tree->root = v;
+    } else if (u == u->parent->left) {
+        u->parent->left = v;
+    } else {
+        u->parent->right = v;
+    }
+    v->parent = u->parent;
+}
+
+static void tree_delete_fixup(Tree *tree, TreeNode *x) {
+    while (x != tree->root && x->color == TREE_NODE_BLACK) {
+        if (x == x->parent->left) {
+            TreeNode *w = x->parent->right;
+            if (w->color == TREE_NODE_RED) {
+                w->color = TREE_NODE_BLACK;
+                x->parent->color = TREE_NODE_RED;
+                tree_left_rotate(tree, x->parent);
+                w = x->parent->right;
+            }
+            if (w->left->color == TREE_NODE_BLACK && w->right->color == TREE_NODE_BLACK) {
+                w->color = TREE_NODE_RED;
+                x = x->parent;
+            } else {
+                if (w->right->color == TREE_NODE_BLACK){ 
+                    w->left->color = TREE_NODE_BLACK;
+                    w->color = TREE_NODE_RED;
+                    tree_right_rotate(tree, w);
+                    w = x->parent->right;
+                }
+                w->color = x->parent->color;
+                x->parent->color = TREE_NODE_BLACK;
+                w->right->color = TREE_NODE_BLACK;
+                tree_left_rotate(tree, x->parent);
+                x = tree->root;
+            }
+        } else {
+            TreeNode *w = x->parent->left;
+            if (w->color == TREE_NODE_RED) {
+                w->color = TREE_NODE_BLACK;
+                x->parent->color = TREE_NODE_RED;
+                tree_right_rotate(tree, x->parent);
+                w = x->parent->left;
+            }
+            if (w->right->color == TREE_NODE_BLACK && w->left->color == TREE_NODE_BLACK) {
+                w->color = TREE_NODE_RED;
+                x = x->parent;
+            } else {
+                if (w->left->color == TREE_NODE_BLACK){ 
+                    w->right->color = TREE_NODE_BLACK;
+                    w->color = TREE_NODE_RED;
+                    tree_left_rotate(tree, w);
+                    w = x->parent->left;
+                }
+                w->color = x->parent->color;
+                x->parent->color = TREE_NODE_BLACK;
+                w->left->color = TREE_NODE_BLACK;
+                tree_right_rotate(tree, x->parent);
+                x = tree->root;
+            }
+        }
+    }
+    x->color = TREE_NODE_BLACK;
+}
+
+static void tree_delete(Tree *tree, TreeNode *z) {
+    TreeNode *x;
+    TreeNode *y = z;
+    TreeNodeColor y_original_color = y->color;
+    if (z->left == tree->null) {
+        x = z->right;
+        tree_node_transplant(tree, z, z->right);
+    } else if (z->right == tree->null) {
+        x = z->left;
+        tree_node_transplant(tree, z, z->left);
+    } else {
+        y = tree_minimum(tree, z->right);
+        y_original_color = y->color;
+        x = y->right;
+        if (y != z->right) {
+            tree_node_transplant(tree, y, y->right);
+            y->right = z->right;
+            y->right->parent = y;
+        } else {
+            x->parent = y;
+        }
+        tree_node_transplant(tree, z, y);
+        y->left = z->left;
+        y->left->parent = y;
+        y->color = z->color;
+    }
+    if (y_original_color == TREE_NODE_BLACK) {
+        tree_delete_fixup(tree, x);
     }
 }
