@@ -555,9 +555,11 @@ static void *heap_allocate_from_free_list(HeapAllocator *allocator, isize size) 
 
 static void *heap_allocate_from_new_region(HeapAllocator *allocator, isize size) {
     // Additionally make space for the zero-sized "guard" block placed at the end of the new region.
-    isize new_memory_size = (BLOCK_HEADER_SIZE + size) + (BLOCK_HEADER_SIZE + 0);
-    new_memory_size = ALIGN_UP(new_memory_size, SYSTEM_ALLOCATE_GRANULARITY);
+    isize new_memory_size =
+        REGION_HEADER_SIZE +
+        (BLOCK_HEADER_SIZE + size) + (BLOCK_HEADER_SIZE + 0);
     new_memory_size = isize_max(new_memory_size, SYSTEM_ALLOCATE_MIN_SIZE);
+    new_memory_size = ALIGN_UP(new_memory_size, SYSTEM_ALLOCATE_GRANULARITY);
 
     void *new_region_memory;
     if (allocator->system.allocate != NULL) {
@@ -720,7 +722,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
     // Try to take memory from the previous (and possibly the next) block.
 
-    if (BLOCK_IS_FREE(BLOCK_PREVIOUS(block))) {
+    if (BLOCK_PREVIOUS_IS_FREE(block)) {
         Block *previous_block = BLOCK_PREVIOUS(block);
         Block *next_block = BLOCK_IS_FREE(BLOCK_NEXT(block)) ? BLOCK_NEXT(block) : NULL;
 

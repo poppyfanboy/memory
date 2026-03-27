@@ -5,8 +5,6 @@ typedef unsigned char u8;
 typedef ptrdiff_t isize;
 typedef size_t usize;
 
-#define SYSTEM_HEAP_CAPACITY ((isize)64 * 1024 * 1024 * 1024)
-
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +17,8 @@ void *system_allocate(isize size) {
 void system_deallocate(void *memory) {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
+
+#define SYSTEM_HEAP_CAPACITY ((isize)64 * 1024 * 1024 * 1024)
 
 typedef struct {
     void *base;
@@ -113,9 +113,18 @@ HeapAllocator *heap_allocator(void) {
 
 void heap_dump(HeapAllocator const *allocator) {
     HeapIterator iterator = {0};
-    heap_iterate(allocator, &iterator);
+    void *previous_region = NULL;
 
-    while (iterator.memory != NULL) {
+    while (true) {
+        heap_iterate(allocator, &iterator);
+        if (iterator.memory == NULL) {
+            break;
+        }
+
+        if (previous_region != iterator.region) {
+            printf("# Region\n");
+        }
+
         if (iterator.memory == allocator) {
             printf(
                 "[0x%p] %9td bytes: Allocator metadata\n",
@@ -131,6 +140,6 @@ void heap_dump(HeapAllocator const *allocator) {
             );
         }
 
-        heap_iterate(allocator, &iterator);
+        previous_region = iterator.region;
     }
 }
