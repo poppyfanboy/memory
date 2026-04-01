@@ -180,65 +180,27 @@ static Block *block_split(Block *block, isize new_size) {
     return remainder_block;
 }
 
-typedef Block *BlockList;
+typedef struct ListNode ListNode;
 
-typedef struct {
-    Block *previous;
-    Block *next;
-} BlockListNode;
+struct ListNode {
+    ListNode *previous;
+    ListNode *next;
+};
 
-#define BLOCK_LIST_NODE(block) ((BlockListNode *)BLOCK_MEMORY(block))
+#define BLOCK_LIST_NODE(block) ((ListNode *)BLOCK_MEMORY(block))
+#define BLOCK_FROM_LIST_NODE(node) ((Block *)BLOCK_FROM_MEMORY(node))
 
-static void block_list_add(BlockList *list, Block *block) {
-    Block *previous = NULL;
-    Block *next = *list;
-    while (next != NULL && BLOCK_SIZE(block) > BLOCK_SIZE(next)) {
-        previous = next;
-        next = BLOCK_LIST_NODE(next)->next;
-    }
+static void list_insert(ListNode *list, ListNode *node) {
+    node->next = list->next;
+    node->previous = list;
 
-    if (previous == NULL) {
-        *list = block;
-    }
-    BLOCK_LIST_NODE(block)->previous = previous;
-    BLOCK_LIST_NODE(block)->next = next;
-
-    if (previous != NULL) {
-        BLOCK_LIST_NODE(previous)->next = block;
-    }
-    if (next != NULL) {
-        BLOCK_LIST_NODE(next)->previous = block;
-    }
+    list->next->previous = node;
+    list->next = node;
 }
 
-static void block_list_remove(BlockList *list, Block *block) {
-    if (*list == block) {
-        *list = BLOCK_LIST_NODE(*list)->next;
-    }
-
-    Block *previous = BLOCK_LIST_NODE(block)->previous;
-    if (previous != NULL) {
-        BLOCK_LIST_NODE(previous)->next = BLOCK_LIST_NODE(block)->next;
-    }
-
-    Block *next = BLOCK_LIST_NODE(block)->next;
-    if (next != NULL) {
-        BLOCK_LIST_NODE(next)->previous = BLOCK_LIST_NODE(block)->previous;
-    }
-}
-
-static Block *block_list_get(BlockList *list, isize min_size) {
-    Block *block_iter = *list;
-    while (block_iter != NULL && BLOCK_SIZE(block_iter) < min_size) {
-        block_iter = BLOCK_LIST_NODE(block_iter)->next;
-    }
-
-    if (block_iter != NULL) {
-        block_list_remove(list, block_iter);
-        return block_iter;
-    } else {
-        return NULL;
-    }
+static void list_delete(ListNode *node) {
+    node->previous->next = node->next;
+    node->next->previous = node->previous;
 }
 
 typedef enum {
@@ -337,11 +299,14 @@ typedef struct {
     SystemHeapGrow heap_grow;
 } SystemMemoryFunctions;
 
+// This structure must be pinned in memory, so that addresses of linked list sentinels never change.
 struct HeapAllocator {
     RegionList regions;
 
+    // Sentinel elements representing circular linked lists.
+    // "free_blocks[N].next" points to the first list element, ".previous" points to the last one.
+    ListNode free_blocks[64];
     u64 free_blocks_availability;
-    BlockList free_blocks[64];
 
     Tree free_block_tree;
 
@@ -376,6 +341,11 @@ static HeapAllocator *heap_allocator_bootstrap(
 
     memory_set(allocator, sizeof(HeapAllocator), 0);
     region_list_prepend(&allocator->regions, initial_region);
+
+    for (int i = 0; i < ARRAY_COUNT(allocator->free_blocks); i += 1) {
+        allocator->free_blocks[i].next = &allocator->free_blocks[i];
+        allocator->free_blocks[i].previous = &allocator->free_blocks[i];
+    }
 
     tree_null_node->color = TREE_NODE_BLACK;
     allocator->free_block_tree.null = tree_null_node;
@@ -459,7 +429,7 @@ static void heap_allocator_free_list_add(HeapAllocator *allocator, Block *block)
     isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
 
     if (list_index < ARRAY_COUNT(allocator->free_blocks)) {
-        block_list_add(&allocator->free_blocks[list_index], block);
+        list_insert(&allocator->free_blocks[list_index], BLOCK_LIST_NODE(block));
         allocator->free_blocks_availability |= (u64)1 << list_index;
     } else {
         tree_insert(&allocator->free_block_tree, BLOCK_TREE_NODE(block));
@@ -470,8 +440,10 @@ static void heap_allocator_free_list_remove(HeapAllocator *allocator, Block *blo
     isize list_index = heap_allocator_free_list_index(allocator, BLOCK_SIZE(block));
 
     if (list_index < ARRAY_COUNT(allocator->free_blocks)) {
-        block_list_remove(&allocator->free_blocks[list_index], block);
-        if (allocator->free_blocks[list_index] == NULL) {
+        list_delete(BLOCK_LIST_NODE(block));
+
+        ListNode *list = &allocator->free_blocks[list_index];
+        if (list->next == list) {
             allocator->free_blocks_availability &= ~((u64)1 << list_index);
         }
     } else {
@@ -524,7 +496,10 @@ static void *heap_allocate_from_free_list(HeapAllocator *allocator, isize size) 
             int free_list_index = u64_trailing_zeroes(
                 allocator->free_blocks_availability & free_blocks_availability_mask
             );
-            free_block = block_list_get(&allocator->free_blocks[free_list_index], size);
+
+            ListNode *list = &allocator->free_blocks[free_list_index];
+            free_block = BLOCK_FROM_LIST_NODE(list->next);
+            list_delete(list->next);
         }
     }
 
