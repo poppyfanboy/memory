@@ -10,57 +10,58 @@ typedef size_t usize;
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-void *system_allocate(isize size) {
+void *system_allocate(void *user_context, isize size) {
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
-void system_deallocate(void *memory) {
+void system_deallocate(void *user_context, void *memory) {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
 #define SYSTEM_HEAP_CAPACITY ((isize)64 * 1024 * 1024 * 1024)
 
 typedef struct {
+    usize page_size;
+
     void *base;
     isize allocated;
     isize committed;
     isize reserved;
 } SystemHeap;
 
-SystemHeap system_heap = {0};
-usize page_size = 0;
+void *system_heap_grow(void *user_context, isize increment) {
+    SystemHeap *system_heap = user_context;
 
-void *system_heap_grow(isize increment) {
-    if (system_heap.base == NULL) {
+    if (system_heap->base == NULL) {
         void *heap_base = VirtualAlloc(NULL, SYSTEM_HEAP_CAPACITY, MEM_RESERVE, PAGE_READWRITE);
         if (heap_base == NULL) {
             return NULL;
         }
 
-        system_heap.base = heap_base;
-        system_heap.allocated = 0;
-        system_heap.committed = 0;
-        system_heap.reserved = SYSTEM_HEAP_CAPACITY;
+        system_heap->base = heap_base;
+        system_heap->allocated = 0;
+        system_heap->committed = 0;
+        system_heap->reserved = SYSTEM_HEAP_CAPACITY;
 
         SYSTEM_INFO system_info;
         GetSystemInfo(&system_info);
-        page_size = system_info.dwPageSize;
+        system_heap->page_size = system_info.dwPageSize;
     }
 
     if (increment == 0) {
-        return system_heap.base;
+        return system_heap->base;
     }
 
-    if (system_heap.allocated + increment > system_heap.reserved) {
+    if (system_heap->allocated + increment > system_heap->reserved) {
         return NULL;
     }
 
-    isize bytes_to_commit = (system_heap.allocated + increment) - system_heap.committed;
+    isize bytes_to_commit = (system_heap->allocated + increment) - system_heap->committed;
     if (bytes_to_commit > 0) {
-        bytes_to_commit = (bytes_to_commit + page_size - 1) / page_size * page_size;
+        bytes_to_commit = (bytes_to_commit + system_heap->page_size - 1) / system_heap->page_size * system_heap->page_size;
 
         void *commit_result = VirtualAlloc(
-            (u8 *)system_heap.base + system_heap.committed,
+            (u8 *)system_heap->base + system_heap->committed,
             bytes_to_commit,
             MEM_COMMIT,
             PAGE_READWRITE
@@ -69,11 +70,11 @@ void *system_heap_grow(isize increment) {
             return NULL;
         }
 
-        system_heap.committed += bytes_to_commit;
+        system_heap->committed += bytes_to_commit;
     }
 
-    void *memory = (u8 *)system_heap.base + system_heap.allocated;
-    system_heap.allocated += increment;
+    void *memory = (u8 *)system_heap->base + system_heap->allocated;
+    system_heap->allocated += increment;
 
     return memory;
 }
@@ -105,9 +106,16 @@ uint32_t pcg32_random(PCG32 *rng) {
 
 HeapAllocator *heap_allocator(void) {
     #ifdef USE_SYSTEM_HEAP
-    return heap_allocator_from_system_heap(system_heap_grow);
+    SystemHeap *system_heap = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SystemHeap));
+    return heap_allocator_create(
+        system_heap, system_heap_grow, NULL,
+        SYSTEM_ALLOCATE_IS_CONTIGUOUS | SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY
+    );
     #else
-    return heap_allocator_create(system_allocate, system_deallocate);
+    return heap_allocator_create(
+        NULL, system_allocate, system_deallocate,
+        0
+    );
     #endif
 }
 

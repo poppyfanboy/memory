@@ -4,18 +4,20 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-void memory_set(void *memory, ptrdiff_t size, unsigned char filler);
-void memory_copy(void const *source, ptrdiff_t size, void *dest);
-void memory_move(void const *source, ptrdiff_t size, void *dest);
+#define SYSTEM_ALLOCATE_IS_CONTIGUOUS 0x1
+#define SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY 0x2
 
 typedef struct HeapAllocator HeapAllocator;
 
-typedef void *(*SystemAllocate)(ptrdiff_t size);
-typedef void (*SystemDeallocate)(void *memory);
-HeapAllocator *heap_allocator_create(SystemAllocate allocate, SystemDeallocate deallocate);
+typedef void *(*SystemAllocate)(void *user_context, ptrdiff_t size);
+typedef void (*SystemDeallocate)(void *user_context, void *memory);
 
-typedef void *(*SystemHeapGrow)(ptrdiff_t increment);
-HeapAllocator *heap_allocator_from_system_heap(SystemHeapGrow heap_grow);
+HeapAllocator *heap_allocator_create(
+    void *user_context,
+    SystemAllocate system_allocate,
+    SystemDeallocate system_deallocate,
+    unsigned int flags
+);
 
 void *heap_allocate(HeapAllocator *allocator, ptrdiff_t size);
 void *heap_reallocate(HeapAllocator *allocator, void *memory, ptrdiff_t new_size);
