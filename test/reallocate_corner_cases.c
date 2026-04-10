@@ -15,15 +15,15 @@ int main(void) {
     heap_dump(allocator);
     printf("\n");
 
-    void *first = heap_reallocate_logged(allocator, NULL, 256);
-    void *second = heap_reallocate_logged(allocator, NULL, 63808);
+    void *first = heap_reallocate_logged(allocator, NULL, 264);
+    void *second = heap_reallocate_logged(allocator, NULL, 63816);
 
     // Now the "second" block is placed between the two free ones.
     // The one to the right is not large enough to satisfy the reallocation request.
     heap_reallocate_logged(allocator, first, 0);
 
-    second = heap_reallocate_logged(allocator, second, 63808 + 256);
-    second = heap_reallocate_logged(allocator, second, 256);
+    second = heap_reallocate_logged(allocator, second, 63816 + 256);
+    second = heap_reallocate_logged(allocator, second, 264);
     second = heap_reallocate_logged(allocator, second, 510 * 1024);
 
     heap_allocator_destroy(allocator);

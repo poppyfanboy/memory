@@ -3,7 +3,8 @@
 #include <stdint.h>
 #include <assert.h>
 
-// This must be at least 8, because lower bits of block sizes are used for storing bit flags.
+// This must be at least 8, because lower bits of block storage sizes are used to store bit flags.
+// Storage size is the total amount of memory occupied by a block, i.e. block size including header.
 #define ALIGNMENT (2 * sizeof(usize))
 
 // Least common multiple of page sizes (alloc granularities to be exact) on Linux / Windows / WASM.
@@ -63,7 +64,7 @@ static inline isize isize_max(isize left, isize right) {
     return left > right ? left : right;
 }
 
-void memory_set(void *memory, isize size, u8 filler) {
+static void memory_set(void *memory, isize size, u8 filler) {
     u8 *memory_bytes = memory;
 
     u8 *memory_iter = memory_bytes;
@@ -73,7 +74,7 @@ void memory_set(void *memory, isize size, u8 filler) {
     }
 }
 
-void memory_copy(void const *source, isize size, void *dest) {
+static void memory_copy(void const *source, isize size, void *dest) {
     u8 const *source_bytes = source;
     u8 *dest_bytes = dest;
 
@@ -90,74 +91,84 @@ typedef struct Block Block;
 typedef struct Region Region;
 
 struct Block {
-    // Size of the memory available inside of the block (i.e. header size is not included).
-    // You can't use this field to access size directly: lower bits are used for storing flags.
-    usize size;
+    // You cannot use this field directly: lower bits are used for storing bit flags.
+    usize storage_size;
 };
 
-#define BLOCK_HEADER_SIZE (isize)ALIGN_UP(sizeof(Block), ALIGNMENT)
+#define BLOCK_PREVIOUS_IS_FREE_BIT (usize)0x1
+#define BLOCK_IS_FREE_BIT (usize)0x2
+#define BLOCK_FLAG_BITS (BLOCK_PREVIOUS_IS_FREE_BIT | BLOCK_IS_FREE_BIT)
+
+#define BLOCK_PREVIOUS_IS_FREE(block) (((block)->storage_size & BLOCK_PREVIOUS_IS_FREE_BIT) != 0)
+#define BLOCK_IS_FREE(block) (((block)->storage_size & BLOCK_IS_FREE_BIT) != 0)
+
+#define BLOCK_HEADER_SIZE (isize)sizeof(Block)
+
+// Total amount memory occupied by a block, including its header.
+// Always a multiple of "ALIGNMENT" to ensure alignment of usable memory stored inside.
+#define BLOCK_STORAGE_SIZE(block) (isize)((block)->storage_size & ~BLOCK_FLAG_BITS)
 
 // This must be at least (3 * sizeof(usize)), because free blocks store additional information:
 // - Two pointers for the intrusive free-lists right after the header.
-// - Size of the block at the very end of the block.
-#define BLOCK_MIN_SIZE 32
+// - Storage size of the block at the very end of block's usable memory.
+#define BLOCK_MIN_SIZE (3 * sizeof(usize))
 
-// Since block sizes are always multiples of "ALIGNMENT", lower bits of block sizes are naturally
-// zero and thus can be used to store additional information.
-#define BLOCK_PREVIOUS_IS_FREE_BIT (usize)0x1
-#define BLOCK_FLAG_BITS (BLOCK_PREVIOUS_IS_FREE_BIT)
-
-#define BLOCK_SIZE(block) (isize)((block)->size & ~BLOCK_FLAG_BITS)
-#define BLOCK_PREVIOUS_IS_FREE(block) (((block)->size & BLOCK_PREVIOUS_IS_FREE_BIT) != 0)
+// Just the size of the usable memory stored inside of the block.
+#define BLOCK_SIZE(block) (BLOCK_STORAGE_SIZE(block) - BLOCK_HEADER_SIZE)
 
 #define BLOCK_MEMORY(block) (void *)((u8 *)(block) + BLOCK_HEADER_SIZE)
 #define BLOCK_FROM_MEMORY(memory) ((Block *)((u8 *)(memory) - BLOCK_HEADER_SIZE))
 
-// Accessing the previous block (or its size) is allowed only when previous block is marked as free.
-// When the previous block is free, it stores its size right before the current block's header.
-#define BLOCK_PREVIOUS_SIZE(block) (isize *)((u8 *)(block) - sizeof(isize))
-#define BLOCK_PREVIOUS(block) \
-    ((Block *)((u8 *)(block) - BLOCK_HEADER_SIZE - *BLOCK_PREVIOUS_SIZE(block)))
+// Accessing these is only allowed when the previous block is marked as free.
+// When the previous block is free, it stores its storage size at the end of usable free memory.
+#define BLOCK_PREVIOUS_STORAGE_SIZE(block) (isize *)((u8 *)(block) - sizeof(isize))
+#define BLOCK_PREVIOUS(block) ((Block *)((u8 *)(block) - *BLOCK_PREVIOUS_STORAGE_SIZE(block)))
 
-// Next block is always accessible thanks to zero-sized guard blocks at the end of each region.
+// Next block is always accessible thanks to the zero-sized guard block at the end of each region.
 #define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
 
-#define BLOCK_IS_FREE(block) BLOCK_PREVIOUS_IS_FREE(BLOCK_NEXT(block))
-
 static inline void block_set_size(Block *block, isize new_size) {
-    block->size = (usize)new_size | (block->size & BLOCK_FLAG_BITS);
+    assert((BLOCK_HEADER_SIZE + new_size) % ALIGNMENT == 0);
+    block->storage_size =
+        (usize)(BLOCK_HEADER_SIZE + new_size) | (block->storage_size & BLOCK_FLAG_BITS);
 }
 
 static inline void block_mark_as_free(Block *block) {
+    block->storage_size |= BLOCK_IS_FREE_BIT;
+
     Block *next_block = BLOCK_NEXT(block);
-    next_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-    *BLOCK_PREVIOUS_SIZE(next_block) = BLOCK_SIZE(block);
+    next_block->storage_size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+    *BLOCK_PREVIOUS_STORAGE_SIZE(next_block) = BLOCK_STORAGE_SIZE(block);
 }
 
 static inline void block_mark_as_in_use(Block *block) {
+    block->storage_size &= ~BLOCK_IS_FREE_BIT;
+
     Block *next_block = BLOCK_NEXT(block);
-    next_block->size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
+    next_block->storage_size &= ~BLOCK_PREVIOUS_IS_FREE_BIT;
 }
 
 // Truncates the block to the desired size by chopping a block from its end.
 // The returned remainder block is automatically marked as free.
 static Block *block_split(Block *block, isize new_size) {
-    isize min_size_to_split = new_size + (BLOCK_HEADER_SIZE + BLOCK_MIN_SIZE);
-    min_size_to_split = ALIGN_UP(min_size_to_split, ALIGNMENT);
-    if (BLOCK_SIZE(block) < min_size_to_split) {
+    isize min_storage_size_to_split =
+        ALIGN_UP(BLOCK_HEADER_SIZE + new_size, ALIGNMENT) +
+        ALIGN_UP(BLOCK_HEADER_SIZE + BLOCK_MIN_SIZE, ALIGNMENT);
+
+    if (BLOCK_STORAGE_SIZE(block) < min_storage_size_to_split) {
         return NULL;
     }
 
-    isize remainder_block_size = BLOCK_SIZE(block) - (BLOCK_HEADER_SIZE + new_size);
+    isize remainder_block_storage_size = BLOCK_STORAGE_SIZE(block) - (BLOCK_HEADER_SIZE + new_size);
     block_set_size(block, new_size);
 
     Block *remainder_block = (Block *)((u8 *)block + (BLOCK_HEADER_SIZE + new_size));
-    remainder_block->size = (usize)remainder_block_size;
+    remainder_block->storage_size = (usize)remainder_block_storage_size;
     block_mark_as_free(remainder_block);
 
     if (BLOCK_IS_FREE(block)) {
-        remainder_block->size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-        *BLOCK_PREVIOUS_SIZE(remainder_block) = BLOCK_SIZE(block);
+        remainder_block->storage_size |= BLOCK_PREVIOUS_IS_FREE_BIT;
+        *BLOCK_PREVIOUS_STORAGE_SIZE(remainder_block) = BLOCK_STORAGE_SIZE(block);
     }
 
     return remainder_block;
@@ -233,7 +244,7 @@ static TreeNode *tree_lower_bound_search(Tree const *tree, isize min_key) {
 }
 
 struct Region {
-    // Memory available for storing blocks. Guard blocks are not included.
+    // Memory available for storing blocks. Guard block is not included.
     void *begin;
     void *end;
 
@@ -243,26 +254,22 @@ struct Region {
 
 #define REGION_FIRST_BLOCK(region) ((Block *)((region)->begin))
 
-// Use two guard blocks, so that accessing "BLOCK_IS_FREE(BLOCK_NEXT(block))" which is expanded into
-// "BLOCK_PREVIOUS_IS_FREE(BLOCK_NEXT(BLOCK_NEXT(block)))" is always safe.
-static void region_initialize_guard_blocks(Region *region) {
-    Block *guard_block = region->end;
-    guard_block->size = (usize)0;
-    BLOCK_NEXT(guard_block)->size = (usize)0;
-}
+// A special zero-sized block which is always marked as "in-use". Placed at the end of each region.
+#define REGION_GUARD_BLOCK(region) ((Block *)((region)->end))
 
 static Region *region_create_for_memory_request(
     void *user_context,
     SystemAllocate allocate,
     isize memory_requested
 ) {
-    isize region_header_size = ALIGN_UP(sizeof(Region), ALIGNMENT);
+    // Choose header size such that address of memory inside of the first block is properly aligned.
+    isize region_header_size =
+        ALIGN_UP(sizeof(Region) + BLOCK_HEADER_SIZE, ALIGNMENT) - BLOCK_HEADER_SIZE;
 
-    isize region_storage_size = isize_max(memory_requested, BLOCK_MIN_SIZE);
-    region_storage_size += region_header_size;
-    // Additionally make space for 2 guard blocks.
-    region_storage_size += 2 * (BLOCK_HEADER_SIZE + 0);
-    region_storage_size = ALIGN_UP(region_storage_size, PAGE_SIZE);
+    isize region_storage_size = ALIGN_UP(
+        region_header_size + isize_max(memory_requested, BLOCK_MIN_SIZE) + (BLOCK_HEADER_SIZE + 0),
+        PAGE_SIZE
+    );
 
     Region *new_region = allocate(user_context, region_storage_size);
     if (new_region == NULL) {
@@ -270,15 +277,20 @@ static Region *region_create_for_memory_request(
     }
 
     new_region->begin = (u8 *)new_region + region_header_size;
-    new_region->end = ((u8 *)new_region + region_storage_size) - 2 * (BLOCK_HEADER_SIZE + 0);
+    isize test = ALIGN_DOWN(region_storage_size - region_header_size, ALIGNMENT);
+    new_region->end =
+        (u8 *)new_region->begin +
+        ALIGN_DOWN(region_storage_size - region_header_size - (BLOCK_HEADER_SIZE + 0), ALIGNMENT);
+
     new_region->previous = NULL;
     new_region->next = NULL;
 
-    region_initialize_guard_blocks(new_region);
+    Block *guard_block = REGION_GUARD_BLOCK(new_region);
+    guard_block->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
 
-    isize first_block_size = ((u8 *)new_region->end - (u8 *)new_region->begin) - BLOCK_HEADER_SIZE;
+    isize first_block_storage_size = (u8 *)new_region->end - (u8 *)new_region->begin;
     Block *first_block = REGION_FIRST_BLOCK(new_region);
-    first_block->size = (usize)first_block_size;
+    first_block->storage_size = (usize)first_block_storage_size;
     block_mark_as_free(first_block);
 
     return new_region;
@@ -384,18 +396,10 @@ void heap_allocator_destroy(HeapAllocator *allocator) {
 
 // Returns ARRAY_COUNT(...) index in case the size is too large for any of fixed-sized free lists.
 static isize heap_allocator_free_list_index(HeapAllocator const *allocator, isize size) {
-    // We "downplay" the size of a free block, so that an allocation of the corresponding size would
-    // definitely fit inside of the block.
-    size = ALIGN_DOWN(size, ALIGNMENT);
+    assert((BLOCK_HEADER_SIZE + size) % ALIGNMENT == 0 && size >= BLOCK_MIN_SIZE);
 
-    isize min_size = ALIGN_UP(BLOCK_MIN_SIZE, ALIGNMENT);
-    assert(size >= min_size);
-
-    isize list_index = isize_min(
-        (size - min_size) / ALIGNMENT,
-        ARRAY_COUNT(allocator->free_blocks)
-    );
-    return list_index;
+    isize min_size = ALIGN_UP(BLOCK_HEADER_SIZE + BLOCK_MIN_SIZE, ALIGNMENT) - BLOCK_HEADER_SIZE;
+    return isize_min((size - min_size) / ALIGNMENT, ARRAY_COUNT(allocator->free_blocks));
 }
 
 static void heap_allocator_free_list_add(HeapAllocator *allocator, Block *block) {
@@ -497,7 +501,7 @@ static Block *heap_allocator_grow_last_block(
         return NULL;
     }
     region->end = (u8 *)region->end + region_increment;
-    region_initialize_guard_blocks(region);
+    REGION_GUARD_BLOCK(region)->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
     block_set_size(block, (u8 *)region->end - (u8 *)BLOCK_MEMORY(block));
 
     return block;
@@ -509,7 +513,7 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     }
 
     size = isize_max(size, BLOCK_MIN_SIZE);
-    size = ALIGN_UP(size, ALIGNMENT);
+    size = ALIGN_UP(BLOCK_HEADER_SIZE + size, ALIGNMENT) - BLOCK_HEADER_SIZE;
 
     // Try to take a block from one of the free lists.
 
@@ -616,7 +620,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     }
 
     new_size = isize_max(new_size, BLOCK_MIN_SIZE);
-    new_size = ALIGN_UP(new_size, ALIGNMENT);
+    new_size = ALIGN_UP(BLOCK_HEADER_SIZE + new_size, ALIGNMENT) - BLOCK_HEADER_SIZE;
 
     Block *block = BLOCK_FROM_MEMORY(memory);
     isize old_size = BLOCK_SIZE(block);

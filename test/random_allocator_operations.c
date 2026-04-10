@@ -121,7 +121,7 @@ int main(void) {
                 String string;
                 string.char_count = int_random(&rng, STRING_MIN_SIZE, STRING_MAX_SIZE);
                 string.chars = heap_allocate(allocator, string.char_count);
-                assert(string.chars != NULL);
+                assert(string.chars != NULL && (usize)string.chars % 16 == 0);
 
                 char starting_char = char_random(&rng);
                 int char_increment = int_random(&rng, 0, 25);
@@ -138,7 +138,7 @@ int main(void) {
                 int new_char_count = int_random(&rng, STRING_MIN_SIZE, STRING_MAX_SIZE);
                 string->char_count = new_char_count;
                 string->chars = heap_reallocate(allocator, string->chars, new_char_count);
-                assert(string->chars != NULL);
+                assert(string->chars != NULL && (usize)string->chars % 16 == 0);
 
                 string_fill(string, string->starting_char, string->char_increment);
             } break;
