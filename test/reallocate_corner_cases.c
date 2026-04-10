@@ -16,13 +16,13 @@ int main(void) {
     printf("\n");
 
     void *first = heap_reallocate_logged(allocator, NULL, 256);
-    void *second = heap_reallocate_logged(allocator, NULL, 260480);
+    void *second = heap_reallocate_logged(allocator, NULL, 63808);
 
     // Now the "second" block is placed between the two free ones.
     // The one to the right is not large enough to satisfy the reallocation request.
     heap_reallocate_logged(allocator, first, 0);
 
-    second = heap_reallocate_logged(allocator, second, 260480 + 256);
+    second = heap_reallocate_logged(allocator, second, 63808 + 256);
     second = heap_reallocate_logged(allocator, second, 256);
     second = heap_reallocate_logged(allocator, second, 510 * 1024);
 
