@@ -120,8 +120,11 @@ int main(void) {
             case ALLOCATE: {
                 String string;
                 string.char_count = int_random(&rng, STRING_MIN_SIZE, STRING_MAX_SIZE);
-                string.chars = heap_allocate(allocator, string.char_count);
+                string.chars = heap_allocate_zeroed(allocator, string.char_count);
                 assert(string.chars != NULL && (usize)string.chars % 16 == 0);
+                for (int i = 0; i < string.char_count; i += 1) {
+                    assert(string.chars[i] == 0);
+                }
 
                 char starting_char = char_random(&rng);
                 int char_increment = int_random(&rng, 0, 25);

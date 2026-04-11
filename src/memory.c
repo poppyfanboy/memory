@@ -1,11 +1,14 @@
 #include "memory.h"
 
-// This must be at least 8, because lower bits of block storage sizes are used to store bit flags.
+// This must be at least 8, because 3 lower bits of block storage size are used to store bit flags.
 // Storage size is the total amount of memory occupied by a block, i.e. block size including header.
 #define ALIGNMENT (2 * sizeof(usize))
 
 // Least common multiple of page sizes (alloc granularities to be exact) on Linux / Windows / WASM.
 #define PAGE_SIZE (64 * 1024)
+
+// Memory requests this large are allocated directly with SystemAllocate. Freed immediately later.
+#define USE_SYSTEM_ALLOCATE_DIRECTLY_THRESHOLD (8 * 1024 * 1024)
 
 #include <stdint.h>
 
@@ -119,11 +122,17 @@ struct Block {
 };
 
 #define BLOCK_PREVIOUS_IS_FREE_BIT (usize)0x1
-#define BLOCK_IS_FREE_BIT (usize)0x2
-#define BLOCK_FLAG_BITS (BLOCK_PREVIOUS_IS_FREE_BIT | BLOCK_IS_FREE_BIT)
-
 #define BLOCK_PREVIOUS_IS_FREE(block) (((block)->storage_size & BLOCK_PREVIOUS_IS_FREE_BIT) != 0)
+
+#define BLOCK_IS_FREE_BIT (usize)0x2
 #define BLOCK_IS_FREE(block) (((block)->storage_size & BLOCK_IS_FREE_BIT) != 0)
+
+#define BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED_BIT (usize)0x4
+#define BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED(block) \
+    (((block)->storage_size & BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED_BIT) != 0)
+
+#define BLOCK_FLAG_BITS \
+    (BLOCK_PREVIOUS_IS_FREE_BIT | BLOCK_IS_FREE_BIT | BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED_BIT)
 
 #define BLOCK_HEADER_SIZE (isize)sizeof(Block)
 
@@ -289,6 +298,10 @@ struct Region {
     Region *next;
 };
 
+// Choose header size such that address of memory inside of the first block is properly aligned.
+#define REGION_HEADER_SIZE \
+    (isize)(ALIGN_UP(sizeof(Region) + BLOCK_HEADER_SIZE, ALIGNMENT) - BLOCK_HEADER_SIZE)
+
 #define REGION_FIRST_BLOCK(region) ((Block *)((region)->begin))
 
 // A special zero-sized block which is always marked as "in-use". Placed at the end of each region.
@@ -304,16 +317,12 @@ static Region *region_create_for_memory_request(
         return NULL;
     }
 
-    // Choose header size such that address of memory inside of the first block is properly aligned.
-    isize region_header_size =
-        ALIGN_UP(sizeof(Region) + BLOCK_HEADER_SIZE, ALIGNMENT) - BLOCK_HEADER_SIZE;
-
-    isize max_overhead = region_header_size + (BLOCK_HEADER_SIZE + 0) + (PAGE_SIZE - 1);
+    isize max_overhead = REGION_HEADER_SIZE + (BLOCK_HEADER_SIZE + 0) + (PAGE_SIZE - 1);
     if ((BLOCK_HEADER_SIZE + memory_request) > ISIZE_MAX - max_overhead) {
         return NULL;
     }
     isize region_storage_size = ALIGN_UP(
-        region_header_size + (BLOCK_HEADER_SIZE + memory_request) + (BLOCK_HEADER_SIZE + 0),
+        REGION_HEADER_SIZE + (BLOCK_HEADER_SIZE + memory_request) + (BLOCK_HEADER_SIZE + 0),
         PAGE_SIZE
     );
 
@@ -322,11 +331,10 @@ static Region *region_create_for_memory_request(
         return NULL;
     }
 
-    new_region->begin = (u8 *)new_region + region_header_size;
-    isize test = ALIGN_DOWN(region_storage_size - region_header_size, ALIGNMENT);
+    new_region->begin = (u8 *)new_region + REGION_HEADER_SIZE;
     new_region->end =
         new_region->begin +
-        ALIGN_DOWN(region_storage_size - region_header_size - (BLOCK_HEADER_SIZE + 0), ALIGNMENT);
+        ALIGN_DOWN(region_storage_size - REGION_HEADER_SIZE - (BLOCK_HEADER_SIZE + 0), ALIGNMENT);
 
     new_region->previous = NULL;
     new_region->next = NULL;
@@ -352,6 +360,19 @@ static void region_list_prepend(RegionList *list, Region *region) {
         (*list)->previous = region;
     }
     *list = region;
+}
+
+static void region_list_remove(RegionList *list, Region *region) {
+    if (*list == region) {
+        *list = region->next;
+    }
+
+    if (region->previous != NULL) {
+        region->previous->next = region->next;
+    }
+    if (region->next != NULL) {
+        region->next->previous = region->previous;
+    }
 }
 
 // Must be pinned in memory, so that sentinels stored inside never change their addresses.
@@ -485,8 +506,14 @@ static void *heap_allocate_from_free_list(HeapAllocator *allocator, isize size) 
             );
 
             ListNode *list = &allocator->free_blocks[free_list_index];
+            assert(list != list->next);
+
             free_block = BLOCK_FROM_LIST_NODE(list->next);
+
             list_delete(list->next);
+            if (list->next == list) {
+                allocator->free_blocks_availability &= ~((u64)1 << free_list_index);
+            }
         }
     }
 
@@ -546,9 +573,39 @@ static Block *heap_allocator_grow_last_block(
     return block;
 }
 
+static inline bool should_use_system_allocate_directly(HeapAllocator const *allocator, isize size) {
+    if (size < USE_SYSTEM_ALLOCATE_DIRECTLY_THRESHOLD) {
+        return false;
+    }
+
+    // Check if the system allocator is capable of releasing memory back to the system.
+    return
+        (allocator->flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) == 0 &&
+        allocator->system_deallocate != NULL;
+}
+
 void *heap_allocate(HeapAllocator *allocator, isize size) {
     if (size == 0) {
         return NULL;
+    }
+
+    if (should_use_system_allocate_directly(allocator, size)) {
+        Region *new_region = region_create_for_memory_request(
+            allocator->user_context,
+            allocator->system_allocate,
+            size
+        );
+        if (new_region == NULL) {
+            return NULL;
+        }
+
+        region_list_prepend(&allocator->regions, new_region);
+
+        Block *new_block = REGION_FIRST_BLOCK(new_region);
+        block_mark_as_in_use(new_block);
+        new_block->storage_size |= BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED_BIT;
+
+        return BLOCK_MEMORY(new_block);
     }
 
     size = block_size_for_memory_request(size);
@@ -621,6 +678,14 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
 
     Block *block = BLOCK_FROM_MEMORY(memory);
 
+    if (BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED(block)) {
+        Region *region = (Region *)((u8 *)block - REGION_HEADER_SIZE);
+        region_list_remove(&allocator->regions, region);
+        allocator->system_deallocate(allocator->user_context, region);
+
+        return;
+    }
+
     Block *previous_block = NULL;
     if (BLOCK_PREVIOUS_IS_FREE(block)) {
         previous_block = BLOCK_PREVIOUS(block);
@@ -660,19 +725,34 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
         return heap_allocate(allocator, new_size);
     }
 
+    Block *block = BLOCK_FROM_MEMORY(memory);
+    isize old_size = BLOCK_SIZE(block);
+
+    if (
+        BLOCK_IS_DIRECTLY_SYSTEM_ALLOCATED(block) ||
+        should_use_system_allocate_directly(allocator, new_size)
+    ) {
+        void *new_memory = heap_allocate(allocator, new_size);
+        if (new_memory == NULL) {
+            return NULL;
+        }
+
+        memcpy(new_memory, memory, isize_min(old_size, new_size));
+        heap_deallocate(allocator, memory);
+
+        return new_memory;
+    }
+
     new_size = block_size_for_memory_request(new_size);
     if (new_size < 0) {
         return NULL;
     }
 
-    Block *block = BLOCK_FROM_MEMORY(memory);
-    isize old_size = BLOCK_SIZE(block);
-
-    // Handle shrinking the block.
-
     if (new_size == old_size) {
         return BLOCK_MEMORY(block);
     }
+
+    // Handle shrinking the block.
 
     if (new_size < old_size) {
         // Merge, so that we don't get two free blocks next to each other after splitting.
@@ -813,6 +893,22 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     heap_deallocate(allocator, memory);
 
     return new_memory;
+}
+
+void *heap_allocate_zeroed(HeapAllocator *allocator, isize size) {
+    void *memory = heap_allocate(allocator, size);
+    if (memory != NULL) {
+        bool is_already_zeroed =
+            should_use_system_allocate_directly(allocator, size) &&
+            (allocator->flags & SYSTEM_ALLOCATE_ZEROES_MEMORY) != 0;
+
+        if (!is_already_zeroed) {
+            isize block_size = BLOCK_SIZE(BLOCK_FROM_MEMORY(memory));
+            memset(memory, 0, block_size);
+        }
+    }
+
+    return memory;
 }
 
 void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
