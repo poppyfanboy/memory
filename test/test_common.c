@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <assert.h>
 
 typedef unsigned char u8;
 typedef ptrdiff_t isize;
@@ -11,6 +12,7 @@ typedef size_t usize;
 #include <windows.h>
 
 void *system_allocate(void *user_context, isize size) {
+    assert(size > 0);
     return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 }
 
@@ -30,6 +32,8 @@ typedef struct {
 } SystemHeap;
 
 void *system_heap_grow(void *user_context, isize increment) {
+    assert(increment >= 0);
+
     SystemHeap *system_heap = user_context;
 
     if (system_heap->base == NULL) {
@@ -109,7 +113,7 @@ HeapAllocator *heap_allocator(void) {
     SystemHeap *system_heap = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SystemHeap));
     return heap_allocator_create(
         system_heap, system_heap_grow, NULL,
-        SYSTEM_ALLOCATE_IS_CONTIGUOUS | SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY
+        SYSTEM_ALLOCATE_IS_CONTIGUOUS
     );
     #else
     return heap_allocator_create(

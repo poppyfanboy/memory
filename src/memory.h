@@ -5,7 +5,6 @@
 #include <stdbool.h>
 
 #define SYSTEM_ALLOCATE_IS_CONTIGUOUS 0x1
-#define SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY 0x2
 
 typedef struct HeapAllocator HeapAllocator;
 

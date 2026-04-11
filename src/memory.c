@@ -1,14 +1,15 @@
 #include "memory.h"
 
-#include <stdint.h>
-#include <assert.h>
-
 // This must be at least 8, because lower bits of block storage sizes are used to store bit flags.
 // Storage size is the total amount of memory occupied by a block, i.e. block size including header.
 #define ALIGNMENT (2 * sizeof(usize))
 
 // Least common multiple of page sizes (alloc granularities to be exact) on Linux / Windows / WASM.
 #define PAGE_SIZE (64 * 1024)
+
+#include <stdint.h>
+
+#define ISIZE_MAX PTRDIFF_MAX
 
 typedef unsigned char u8;
 typedef uint64_t u64;
@@ -19,6 +20,59 @@ typedef ptrdiff_t isize;
 
 #define ALIGN_UP(value, alignment) (((usize)(value) + (alignment) - 1) & (~(usize)(alignment) + 1))
 #define ALIGN_DOWN(value, alignment) ((usize)(value) & (~(usize)(alignment) + 1))
+
+static inline isize isize_min(isize left, isize right) {
+    return left < right ? left : right;
+}
+
+static inline isize isize_max(isize left, isize right) {
+    return left > right ? left : right;
+}
+
+#ifdef __wasm__
+    #define assert(predicate)
+
+    void *memset(void *dest, int filler, usize size) {
+        #ifdef __wasm_bulk_memory__
+        if (size > 16) {
+            return __builtin_memset(dest, filler, size);
+        }
+        #endif
+
+        u8 *dest_iter = dest;
+        u8 *dest_end = (u8 *)dest + size;
+
+        while (dest_iter < dest_end) {
+            *dest_iter = filler;
+            dest_iter += 1;
+        }
+
+        return dest;
+    }
+
+    void *memcpy(void *dest, const void *source, usize size) {
+        #ifdef __wasm_bulk_memory__
+        if (size > 16) {
+            return __builtin_memcpy(dest, source, size);
+        }
+        #endif
+
+        u8 const *source_iter = source;
+        u8 const *source_end = (u8 const *)source + size;
+        u8 *dest_iter = dest;
+
+        while (source_iter < source_end) {
+            *dest_iter = *source_iter;
+            source_iter += 1;
+            dest_iter += 1;
+        }
+
+        return dest;
+    }
+#else
+    #include <assert.h>
+    #include <string.h>
+#endif
 
 #if defined(__clang__) || defined(__GNUC__)
     #define u64_trailing_zeroes __builtin_ctzll
@@ -55,37 +109,6 @@ typedef ptrdiff_t isize;
         return trailing_zeroes;
     }
 #endif
-
-static inline isize isize_min(isize left, isize right) {
-    return left < right ? left : right;
-}
-
-static inline isize isize_max(isize left, isize right) {
-    return left > right ? left : right;
-}
-
-static void memory_set(void *memory, isize size, u8 filler) {
-    u8 *memory_bytes = memory;
-
-    u8 *memory_iter = memory_bytes;
-    while (memory_iter < memory_bytes + size) {
-        *memory_iter = filler;
-        memory_iter += 1;
-    }
-}
-
-static void memory_copy(void const *source, isize size, void *dest) {
-    u8 const *source_bytes = source;
-    u8 *dest_bytes = dest;
-
-    u8 const *source_iter = source_bytes;
-    u8 *dest_iter = dest_bytes;
-    while (source_iter < source_bytes + size) {
-        *dest_iter = *source_iter;
-        source_iter += 1;
-        dest_iter += 1;
-    }
-}
 
 typedef struct Block Block;
 typedef struct Region Region;
@@ -126,6 +149,20 @@ struct Block {
 
 // Next block is always accessible thanks to the zero-sized guard block at the end of each region.
 #define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
+
+// Returns a negative value in case of integer overflow.
+static inline isize block_size_for_memory_request(isize memory_request) {
+    if (memory_request <= BLOCK_MIN_SIZE) {
+        return BLOCK_MIN_SIZE;
+    }
+
+    isize max_overhead = BLOCK_HEADER_SIZE + (ALIGNMENT - 1);
+    if (memory_request > ISIZE_MAX - max_overhead) {
+        return -1;
+    }
+
+    return ALIGN_UP(BLOCK_HEADER_SIZE + memory_request, ALIGNMENT) - BLOCK_HEADER_SIZE;
+}
 
 static inline void block_set_size(Block *block, isize new_size) {
     assert((BLOCK_HEADER_SIZE + new_size) % ALIGNMENT == 0);
@@ -245,8 +282,8 @@ static TreeNode *tree_lower_bound_search(Tree const *tree, isize min_key) {
 
 struct Region {
     // Memory available for storing blocks. Guard block is not included.
-    void *begin;
-    void *end;
+    u8 *begin;
+    u8 *end;
 
     Region *previous;
     Region *next;
@@ -260,14 +297,23 @@ struct Region {
 static Region *region_create_for_memory_request(
     void *user_context,
     SystemAllocate allocate,
-    isize memory_requested
+    isize memory_request
 ) {
+    memory_request = block_size_for_memory_request(memory_request);
+    if (memory_request < 0) {
+        return NULL;
+    }
+
     // Choose header size such that address of memory inside of the first block is properly aligned.
     isize region_header_size =
         ALIGN_UP(sizeof(Region) + BLOCK_HEADER_SIZE, ALIGNMENT) - BLOCK_HEADER_SIZE;
 
+    isize max_overhead = region_header_size + (BLOCK_HEADER_SIZE + 0) + (PAGE_SIZE - 1);
+    if ((BLOCK_HEADER_SIZE + memory_request) > ISIZE_MAX - max_overhead) {
+        return NULL;
+    }
     isize region_storage_size = ALIGN_UP(
-        region_header_size + isize_max(memory_requested, BLOCK_MIN_SIZE) + (BLOCK_HEADER_SIZE + 0),
+        region_header_size + (BLOCK_HEADER_SIZE + memory_request) + (BLOCK_HEADER_SIZE + 0),
         PAGE_SIZE
     );
 
@@ -279,7 +325,7 @@ static Region *region_create_for_memory_request(
     new_region->begin = (u8 *)new_region + region_header_size;
     isize test = ALIGN_DOWN(region_storage_size - region_header_size, ALIGNMENT);
     new_region->end =
-        (u8 *)new_region->begin +
+        new_region->begin +
         ALIGN_DOWN(region_storage_size - region_header_size - (BLOCK_HEADER_SIZE + 0), ALIGNMENT);
 
     new_region->previous = NULL;
@@ -288,7 +334,7 @@ static Region *region_create_for_memory_request(
     Block *guard_block = REGION_GUARD_BLOCK(new_region);
     guard_block->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
 
-    isize first_block_storage_size = (u8 *)new_region->end - (u8 *)new_region->begin;
+    isize first_block_storage_size = new_region->end - new_region->begin;
     Block *first_block = REGION_FIRST_BLOCK(new_region);
     first_block->storage_size = (usize)first_block_storage_size;
     block_mark_as_free(first_block);
@@ -331,10 +377,7 @@ HeapAllocator *heap_allocator_create(
     SystemDeallocate system_deallocate,
     unsigned int flags
 ) {
-    if (
-        (flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) != 0 &&
-        (flags & SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY) != 0
-    ) {
+    if ((flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) != 0) {
         void *system_heap_base = system_allocate(user_context, 0);
         if (system_heap_base == NULL) {
             return NULL;
@@ -355,7 +398,7 @@ HeapAllocator *heap_allocator_create(
     block_mark_as_in_use(initial_block);
 
     HeapAllocator *allocator = BLOCK_MEMORY(initial_block);
-    memory_set(allocator, sizeof(HeapAllocator), 0);
+    memset(allocator, 0, sizeof(HeapAllocator));
 
     region_list_prepend(&allocator->regions, initial_region);
 
@@ -490,19 +533,15 @@ static Block *heap_allocator_grow_last_block(
         // If we are growing the guard block, make space for the replacement guard block.
         region_increment += (BLOCK_HEADER_SIZE + 0);
     }
-    if ((allocator->flags & SYSTEM_ALLOCATE_HAS_BYTE_GRANULARITY) != 0) {
-        region_increment = ALIGN_UP(region_increment, ALIGNMENT);
-    } else {
-        region_increment = ALIGN_UP(region_increment, PAGE_SIZE);
-    }
+    region_increment = ALIGN_UP(region_increment, ALIGNMENT);
 
     void *heap_grow_result = allocator->system_allocate(allocator->user_context, region_increment);
     if (heap_grow_result == NULL) {
         return NULL;
     }
-    region->end = (u8 *)region->end + region_increment;
+    region->end = region->end + region_increment;
     REGION_GUARD_BLOCK(region)->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
-    block_set_size(block, (u8 *)region->end - (u8 *)BLOCK_MEMORY(block));
+    block_set_size(block, region->end - (u8 *)BLOCK_MEMORY(block));
 
     return block;
 }
@@ -512,8 +551,10 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         return NULL;
     }
 
-    size = isize_max(size, BLOCK_MIN_SIZE);
-    size = ALIGN_UP(BLOCK_HEADER_SIZE + size, ALIGNMENT) - BLOCK_HEADER_SIZE;
+    size = block_size_for_memory_request(size);
+    if (size < 0) {
+        return NULL;
+    }
 
     // Try to take a block from one of the free lists.
 
@@ -527,7 +568,7 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
     if ((allocator->flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) != 0) {
         Region *region = allocator->regions;
 
-        Block *last_block = (Block *)region->end;
+        Block *last_block = REGION_GUARD_BLOCK(region);
         if (BLOCK_PREVIOUS_IS_FREE(last_block)) {
             last_block = BLOCK_PREVIOUS(last_block);
             heap_allocator_free_list_remove(allocator, last_block);
@@ -619,8 +660,10 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
         return heap_allocate(allocator, new_size);
     }
 
-    new_size = isize_max(new_size, BLOCK_MIN_SIZE);
-    new_size = ALIGN_UP(BLOCK_HEADER_SIZE + new_size, ALIGNMENT) - BLOCK_HEADER_SIZE;
+    new_size = block_size_for_memory_request(new_size);
+    if (new_size < 0) {
+        return NULL;
+    }
 
     Block *block = BLOCK_FROM_MEMORY(memory);
     isize old_size = BLOCK_SIZE(block);
@@ -696,8 +739,8 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
             block_set_size(merged_block, old_size + max_growth_amount);
             block_mark_as_in_use(merged_block);
 
-            // "memory_copy" will handle copying backwards even for overlaping regions.
-            memory_copy(memory, old_size, BLOCK_MEMORY(merged_block));
+            // "memcpy" will handle copying backwards even for overlaping regions.
+            memcpy(BLOCK_MEMORY(merged_block), memory, old_size);
 
             // Trim the merged block.
             Block *remainder_block = block_split(merged_block, new_size);
@@ -713,7 +756,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
 
     void *new_memory = heap_allocate_from_free_list(allocator, new_size);
     if (new_memory != NULL) {
-        memory_copy(memory, old_size, new_memory);
+        memcpy(new_memory, memory, old_size);
         heap_deallocate(allocator, memory);
         return new_memory;
     }
@@ -723,7 +766,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     if ((allocator->flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) != 0) {
         Region *region = allocator->regions;
 
-        Block *last_free_block = (Block *)region->end;
+        Block *last_free_block = REGION_GUARD_BLOCK(region);
         if (BLOCK_PREVIOUS_IS_FREE(last_free_block)) {
             last_free_block = BLOCK_PREVIOUS(last_free_block);
         }
@@ -766,7 +809,7 @@ void *heap_reallocate(HeapAllocator *allocator, void *memory, isize new_size) {
     if (new_memory == NULL) {
         return NULL;
     }
-    memory_copy(memory, old_size, new_memory);
+    memcpy(new_memory, memory, old_size);
     heap_deallocate(allocator, memory);
 
     return new_memory;
