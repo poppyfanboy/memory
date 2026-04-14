@@ -1,5 +1,13 @@
-/*
+# Ignore everything
+*
 
+# But not these files...
 !.gitignore
-!/src/
-!/test/
+!*.c
+!*.h
+!*.html
+!*.css
+!*.js
+
+# ...even if they are in subdirectories
+!*/

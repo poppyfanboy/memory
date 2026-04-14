@@ -156,7 +156,7 @@ struct Block {
 #define BLOCK_PREVIOUS_STORAGE_SIZE(block) (isize *)((u8 *)(block) - sizeof(isize))
 #define BLOCK_PREVIOUS(block) ((Block *)((u8 *)(block) - *BLOCK_PREVIOUS_STORAGE_SIZE(block)))
 
-// Next block is always accessible thanks to the zero-sized guard block at the end of each region.
+// Next block is always accessible thanks to the guard block at the end of each region.
 #define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
 
 // Returns a negative value in case of integer overflow.
@@ -304,8 +304,11 @@ struct Region {
 
 #define REGION_FIRST_BLOCK(region) ((Block *)((region)->begin))
 
-// A special zero-sized block which is always marked as "in-use". Placed at the end of each region.
+// A special block which is always marked as "in-use". Placed at the end of each region.
 #define REGION_GUARD_BLOCK(region) ((Block *)((region)->end))
+
+#define GUARD_BLOCK_STORAGE_SIZE (isize)ALIGN_UP(BLOCK_HEADER_SIZE, ALIGNMENT)
+#define IS_GUARD_BLOCK(block) (BLOCK_STORAGE_SIZE(block) == GUARD_BLOCK_STORAGE_SIZE)
 
 static Region *region_create_for_memory_request(
     void *user_context,
@@ -317,12 +320,12 @@ static Region *region_create_for_memory_request(
         return NULL;
     }
 
-    isize max_overhead = REGION_HEADER_SIZE + (BLOCK_HEADER_SIZE + 0) + (PAGE_SIZE - 1);
+    isize max_overhead = REGION_HEADER_SIZE + GUARD_BLOCK_STORAGE_SIZE + (PAGE_SIZE - 1);
     if ((BLOCK_HEADER_SIZE + memory_request) > ISIZE_MAX - max_overhead) {
         return NULL;
     }
     isize region_storage_size = ALIGN_UP(
-        REGION_HEADER_SIZE + (BLOCK_HEADER_SIZE + memory_request) + (BLOCK_HEADER_SIZE + 0),
+        REGION_HEADER_SIZE + (BLOCK_HEADER_SIZE + memory_request) + GUARD_BLOCK_STORAGE_SIZE,
         PAGE_SIZE
     );
 
@@ -334,13 +337,13 @@ static Region *region_create_for_memory_request(
     new_region->begin = (u8 *)new_region + REGION_HEADER_SIZE;
     new_region->end =
         new_region->begin +
-        ALIGN_DOWN(region_storage_size - REGION_HEADER_SIZE - (BLOCK_HEADER_SIZE + 0), ALIGNMENT);
+        ALIGN_DOWN(region_storage_size - REGION_HEADER_SIZE - GUARD_BLOCK_STORAGE_SIZE, ALIGNMENT);
 
     new_region->previous = NULL;
     new_region->next = NULL;
 
     Block *guard_block = REGION_GUARD_BLOCK(new_region);
-    guard_block->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
+    guard_block->storage_size = (usize)GUARD_BLOCK_STORAGE_SIZE;
 
     isize first_block_storage_size = new_region->end - new_region->begin;
     Block *first_block = REGION_FIRST_BLOCK(new_region);
@@ -549,16 +552,16 @@ static Block *heap_allocator_grow_last_block(
     Block *block,
     isize block_increment
 ) {
-    assert(BLOCK_SIZE(block) == 0 || BLOCK_SIZE(BLOCK_NEXT(block)) == 0);
+    assert(IS_GUARD_BLOCK(block) || IS_GUARD_BLOCK(BLOCK_NEXT(block)));
 
     Region *region = allocator->regions;
     assert(region->next == NULL);
     assert((allocator->flags & SYSTEM_ALLOCATE_IS_CONTIGUOUS) != 0);
 
     isize region_increment = block_increment;
-    if (BLOCK_SIZE(block) == 0) {
+    if (IS_GUARD_BLOCK(block)) {
         // If we are growing the guard block, make space for the replacement guard block.
-        region_increment += (BLOCK_HEADER_SIZE + 0);
+        region_increment += GUARD_BLOCK_STORAGE_SIZE;
     }
     region_increment = ALIGN_UP(region_increment, ALIGNMENT);
 
@@ -567,7 +570,7 @@ static Block *heap_allocator_grow_last_block(
         return NULL;
     }
     region->end = region->end + region_increment;
-    REGION_GUARD_BLOCK(region)->storage_size = (usize)(BLOCK_HEADER_SIZE + 0);
+    REGION_GUARD_BLOCK(region)->storage_size = (usize)GUARD_BLOCK_STORAGE_SIZE;
     block_set_size(block, region->end - (u8 *)BLOCK_MEMORY(block));
 
     return block;
@@ -926,7 +929,7 @@ void heap_iterate(HeapAllocator const *allocator, HeapIterator *iterator) {
         next_block = BLOCK_NEXT(current_block);
 
         // Go to the next region once we reach the guard block.
-        if (BLOCK_SIZE(next_block) == 0) {
+        if (IS_GUARD_BLOCK(next_block)) {
             Region *region = iterator->region;
             iterator->region = region->next;
             if (region->next != NULL) {

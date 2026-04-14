@@ -13,6 +13,8 @@
 // at the moment and check if they contain what we've put into them initially.
 #define VALIDATION_PERIOD 1000
 
+#define EXPECTED_ALIGNMENT (2 * sizeof(size_t))
+
 typedef struct {
     char *chars;
     int char_count;
@@ -121,7 +123,7 @@ int main(void) {
                 String string;
                 string.char_count = int_random(&rng, STRING_MIN_SIZE, STRING_MAX_SIZE);
                 string.chars = heap_allocate_zeroed(allocator, string.char_count);
-                assert(string.chars != NULL && (usize)string.chars % 16 == 0);
+                assert(string.chars != NULL && (usize)string.chars % EXPECTED_ALIGNMENT == 0);
                 for (int i = 0; i < string.char_count; i += 1) {
                     assert(string.chars[i] == 0);
                 }
@@ -141,7 +143,7 @@ int main(void) {
                 int new_char_count = int_random(&rng, STRING_MIN_SIZE, STRING_MAX_SIZE);
                 string->char_count = new_char_count;
                 string->chars = heap_reallocate(allocator, string->chars, new_char_count);
-                assert(string->chars != NULL && (usize)string->chars % 16 == 0);
+                assert(string->chars != NULL && (usize)string->chars % EXPECTED_ALIGNMENT == 0);
 
                 string_fill(string, string->starting_char, string->char_increment);
             } break;
