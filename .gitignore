@@ -2,12 +2,19 @@
 *
 
 # But not these files...
+
 !.gitignore
+!*.yml
+
 !*.c
 !*.h
+
 !*.html
 !*.css
 !*.js
+!*.woff2
+!*.ico
+!*.wasm
 
 # ...even if they are in subdirectories
 !*/

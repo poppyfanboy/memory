@@ -5,15 +5,52 @@
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="stylesheet" href="style.css" />
+        <link rel="icon" href="favicon.ico" />
     </head>
 
-    <body>
-        <h1>Heap Allocator</h1>
+    <body class="screen">
+        <header>
+            <h1>Heap Allocator</h1>
 
-        <input id="size-input" type="number" value="16" min="0" autocomplete="off" />
-        <button id="allocate-button">Allocate</button>
+            <button id="theme-button" class="theme-button">
+                <svg class="theme-button__light-icon" width="1.25rem" height="1.25rem" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M7 3V0H9V3H7Z" fill="currentColor" />
+                    <path d="M9 13V16H7V13H9Z" fill="currentColor" />
+                    <path d="M11 8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8C5 6.34315 6.34315 5 8 5C9.65685 5 11 6.34315 11 8Z" fill="currentColor" />
+                    <path d="M0 9H3V7H0V9Z" fill="currentColor" />
+                    <path d="M16 7H13V9H16V7Z" fill="currentColor" />
+                    <path d="M3.75735 5.17157L1.63603 3.05025L3.05025 1.63603L5.17157 3.75735L3.75735 5.17157Z" fill="currentColor" />
+                    <path d="M12.2426 10.8284L14.364 12.9497L12.9497 14.364L10.8284 12.2426L12.2426 10.8284Z" fill="currentColor" />
+                    <path d="M3.05025 14.364L5.17157 12.2426L3.75735 10.8284L1.63603 12.9498L3.05025 14.364Z" fill="currentColor" />
+                    <path d="M12.9497 1.63604L10.8284 3.75736L12.2426 5.17158L14.364 3.05026L12.9497 1.63604Z" fill="currentColor" />
+                </svg>
 
-        <pre id="display"></pre>
+                <svg class="theme-button__dark-icon" width="1.25rem" height="1.25rem" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M0 8.00002C0 4.75562 1.93132 1.9623 4.70701 0.707031L5.65436 1.65438C5.2352 2.51383 5 3.47946 5 4.50002C5 8.08987 7.91015 11 11.5 11C12.5206 11 13.4862 10.7648 14.3456 10.3457L15.293 11.293C14.0377 14.0687 11.2444 16 8 16C3.58172 16 0 12.4183 0 8.00002Z" fill="currentColor" />
+                    <path d="M11.5 7.00003L9 4.50003L11.5 2.00003L14 4.50003L11.5 7.00003Z" fill="currentColor" />
+                </svg>
+            </button>
+
+            <a href="#" class="code-link">
+                <svg width="1.25rem" height="1.25rem" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M8.01005 0.858582L6.01005 14.8586L7.98995 15.1414L9.98995 1.14142L8.01005 0.858582Z" fill="currentColor" />
+                    <path d="M12.5 11.5L11.0858 10.0858L13.1716 8L11.0858 5.91422L12.5 4.5L16 8L12.5 11.5Z" fill="currentColor" />
+                    <path d="M2.82843 8L4.91421 10.0858L3.5 11.5L0 8L3.5 4.5L4.91421 5.91422L2.82843 8Z" fill="currentColor" />
+                </svg>
+            </a>
+        </header>
+
+        <main>
+            <div class="allocation-form">
+                <input id="allocation-size-input" class="allocation-form__size-input" type="text" placeholder="Size in bytes" autocomplete="off" />
+                <button id="allocate-button" class="allocation-form__allocate-button">Allocate</button>
+            </div>
+
+            <div class="block-list" id="block-list"></div>
+            <template id="block-list-node-template">
+                <div class="block-list__node"></div>
+            </template>
+        </main>
 
         <script src="main.js" type="module"></script>
     </body>

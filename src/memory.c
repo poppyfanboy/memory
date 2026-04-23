@@ -307,7 +307,7 @@ struct Region {
 // A special block which is always marked as "in-use". Placed at the end of each region.
 #define REGION_GUARD_BLOCK(region) ((Block *)((region)->end))
 
-#define GUARD_BLOCK_STORAGE_SIZE (isize)ALIGN_UP(BLOCK_HEADER_SIZE, ALIGNMENT)
+#define GUARD_BLOCK_STORAGE_SIZE (isize)0
 #define IS_GUARD_BLOCK(block) (BLOCK_STORAGE_SIZE(block) == GUARD_BLOCK_STORAGE_SIZE)
 
 static Region *region_create_for_memory_request(

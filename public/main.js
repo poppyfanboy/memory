@@ -24,71 +24,120 @@ class SystemHeap {
     }
 }
 
-class HeapIterator {
-    constructor(buffer, address) {
-        this.view = new Uint32Array(buffer, address);
+class HeapAllocator {
+    constructor(instance, systemHeap, address) {
+        this.instance = instance;
+        this.systemHeap = systemHeap;
+        this.address = address;
     }
 
-    get region() {
-        return this.view[0];
+    static async initialize() {
+        const systemHeap = new SystemHeap(16);
+
+        const { instance } = await WebAssembly.instantiateStreaming(fetch('lib.wasm'), {
+            env: {
+                memory: systemHeap.memory,
+                system_allocate: (_userContext, size) => systemHeap.grow(size),
+            }
+        });
+
+        systemHeap.offset = instance.exports.__heap_base;
+        const address = instance.exports.heap_allocator();
+
+        return new this(instance, systemHeap, address);
     }
 
-    get memory() {
-        return this.view[1];
+    allocate(size) {
+        return this.instance.exports.heap_allocate(this.address, size);
     }
 
-    get size() {
-        return this.view[2];
-    }
-
-    get isFree() {
-        return this.view[3] != 0;
+    blocks() {
+        return new HeapIterator(this);
     }
 }
 
-const systemHeap = new SystemHeap(16);
+class HeapIterator {
+    constructor(allocator) {
+        this.allocator = allocator;
 
-const { instance } = await WebAssembly.instantiateStreaming(fetch('lib.wasm'), {
-    env: {
-        memory: systemHeap.memory,
-        system_allocate: (_userContext, size) => systemHeap.grow(size),
+        const iteratorAddress = this.allocator.instance.exports.heap_iterator();
+        const iteratorBuffer = this.allocator.systemHeap.memory.buffer;
+        this.view = new Uint32Array(iteratorBuffer, iteratorAddress);
+
+        this.allocator.instance.exports.heap_iterate(allocator.address, iteratorAddress);
     }
-});
 
-systemHeap.offset = instance.exports.__heap_base;
-const allocatorAddress = instance.exports.heap_allocator();
-
-const displayElement = document.getElementById('display');
-
-function allocatorDump() {
-    const iteratorAddress = instance.exports.heap_iterator();
-    const iterator = new HeapIterator(systemHeap.memory.buffer, iteratorAddress);
-
-    let displayText = '';
-    while (true) {
-        instance.exports.heap_iterate(allocatorAddress, iteratorAddress);
-        if (iterator.memory == 0) {
-            break;
+    next() {
+        const value = {
+            region: this.view[0],
+            memory: this.view[1],
+            size: this.view[2],
+            isFree: this.view[3] != 0,
+        };
+        if (value.memory == 0) {
+            return { done: true };
         }
 
-        const addressFormatted = `0x${iterator.memory.toString(16).padStart(8, '0')}`;
-        const sizeFormatted = iterator.size.toString().padStart(9);
-        const blockDescription = iterator.memory == allocatorAddress
-            ? 'Allocator metadata'
-            : `${iterator.isFree ? 'Free' : 'Occupied'} block`;
-
-        displayText += `[${addressFormatted}] ${sizeFormatted} bytes: ${blockDescription}\n`;
+        this.allocator.instance.exports.heap_iterate(this.allocator.address, this.view.byteOffset);
+        return { value, done: false };
     }
 
-    displayElement.textContent = displayText;
+    [Symbol.iterator]() {
+        return this;
+    }
 }
 
-const sizeInput = document.getElementById('size-input');
+class BlockList {
+    constructor(allocator, root) {
+        this.allocator = allocator;
+        this.root = root;
+
+        this.refresh();
+    }
+
+    refresh() {
+        while (this.root.firstChild != null) {
+            this.root.firstChild.remove();
+        }
+
+        const nodeTemplate = document.getElementById('block-list-node-template');
+
+        for (const block of this.allocator.blocks()) {
+            const nodeRoot = document.importNode(nodeTemplate.content, true);
+            const node = nodeRoot.querySelector('.block-list__node');
+
+            const addressFormatted = `0x${block.memory.toString(16).padStart(8, '0')}`;
+            const sizeFormatted = block.size.toString().padStart(9);
+            const blockDescription = block.memory == this.allocator.address
+                ? 'Allocator metadata'
+                : `${block.isFree ? 'Free' : 'Occupied'} block`;
+
+            node.textContent = `[${addressFormatted}] ${sizeFormatted} bytes: ${blockDescription}`;
+            this.root.appendChild(nodeRoot);
+        }
+    }
+}
+
+let theme = 'light';
+const themeButton = document.getElementById('theme-button');
+
+themeButton.addEventListener('click', () => {
+    if (theme == 'light') {
+        theme = 'dark';
+    } else {
+        theme = 'light';
+    }
+
+    document.documentElement.dataset.theme = theme;
+});
+
+const allocator = await HeapAllocator.initialize();
+
+const blockList = new BlockList(allocator, document.getElementById('block-list'));
+const allocationSizeInput = document.getElementById('allocation-size-input');
 const allocateButton = document.getElementById('allocate-button');
 
 allocateButton.addEventListener('click', () => {
-    instance.exports.heap_allocate(allocatorAddress, sizeInput.value);
-    allocatorDump();
+    allocator.allocate(allocationSizeInput.value);
+    blockList.refresh();
 });
-
-allocatorDump();
