@@ -62,7 +62,8 @@ void *system_heap_grow(void *user_context, isize increment) {
 
     isize bytes_to_commit = (system_heap->allocated + increment) - system_heap->committed;
     if (bytes_to_commit > 0) {
-        bytes_to_commit = (bytes_to_commit + system_heap->page_size - 1) / system_heap->page_size * system_heap->page_size;
+        bytes_to_commit = bytes_to_commit + system_heap->page_size - 1;
+        bytes_to_commit = bytes_to_commit / system_heap->page_size * system_heap->page_size;
 
         void *commit_result = VirtualAlloc(
             (u8 *)system_heap->base + system_heap->committed,

@@ -153,8 +153,8 @@ struct Block {
 
 // Accessing these is only allowed when the previous block is marked as free.
 // When the previous block is free, it stores its storage size at the end of usable free memory.
-#define BLOCK_PREVIOUS_STORAGE_SIZE(block) (isize *)((u8 *)(block) - sizeof(isize))
-#define BLOCK_PREVIOUS(block) ((Block *)((u8 *)(block) - *BLOCK_PREVIOUS_STORAGE_SIZE(block)))
+#define BLOCK_PREVIOUS_STORAGE_SIZE(block) (*(isize *)((u8 *)(block) - sizeof(isize)))
+#define BLOCK_PREVIOUS(block) ((Block *)((u8 *)(block) - BLOCK_PREVIOUS_STORAGE_SIZE(block)))
 
 // Next block is always accessible thanks to the guard block at the end of each region.
 #define BLOCK_NEXT(block) ((Block *)((u8 *)(block) + BLOCK_HEADER_SIZE + BLOCK_SIZE(block)))
@@ -184,7 +184,7 @@ static inline void block_mark_as_free(Block *block) {
 
     Block *next_block = BLOCK_NEXT(block);
     next_block->storage_size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-    *BLOCK_PREVIOUS_STORAGE_SIZE(next_block) = BLOCK_STORAGE_SIZE(block);
+    BLOCK_PREVIOUS_STORAGE_SIZE(next_block) = BLOCK_STORAGE_SIZE(block);
 }
 
 static inline void block_mark_as_in_use(Block *block) {
@@ -214,7 +214,7 @@ static Block *block_split(Block *block, isize new_size) {
 
     if (BLOCK_IS_FREE(block)) {
         remainder_block->storage_size |= BLOCK_PREVIOUS_IS_FREE_BIT;
-        *BLOCK_PREVIOUS_STORAGE_SIZE(remainder_block) = BLOCK_STORAGE_SIZE(block);
+        BLOCK_PREVIOUS_STORAGE_SIZE(remainder_block) = BLOCK_STORAGE_SIZE(block);
     }
 
     return remainder_block;
@@ -304,11 +304,19 @@ struct Region {
 
 #define REGION_FIRST_BLOCK(region) ((Block *)((region)->begin))
 
-// A special block which is always marked as "in-use". Placed at the end of each region.
+// A special block stored at the end of each region. Always marked as "in-use".
+// This makes looking up the next neighboring block for any other block always safe.
+//
+// Stores a pointer to the beginning of the region.
+// Given the last block within the region, this allows us to tell if it spans the entire region.
 #define REGION_GUARD_BLOCK(region) ((Block *)((region)->end))
+#define REGION_FROM_GUARD_BLOCK(block) (*(Region **)BLOCK_MEMORY(block))
 
-#define GUARD_BLOCK_STORAGE_SIZE (isize)0
-#define IS_GUARD_BLOCK(block) (BLOCK_STORAGE_SIZE(block) == GUARD_BLOCK_STORAGE_SIZE)
+// Guard block's storage size is marked as 0 to differentiate it from normal blocks.
+#define IS_GUARD_BLOCK(block) (BLOCK_STORAGE_SIZE(block) == 0)
+
+// Actual guard block storage includes block header and a pointer to the beginning of the region.
+#define GUARD_BLOCK_STORAGE_SIZE (isize)ALIGN_UP(BLOCK_HEADER_SIZE + sizeof(usize), ALIGNMENT)
 
 static Region *region_create_for_memory_request(
     void *user_context,
@@ -343,7 +351,8 @@ static Region *region_create_for_memory_request(
     new_region->next = NULL;
 
     Block *guard_block = REGION_GUARD_BLOCK(new_region);
-    guard_block->storage_size = (usize)GUARD_BLOCK_STORAGE_SIZE;
+    guard_block->storage_size = (usize)0;
+    REGION_FROM_GUARD_BLOCK(guard_block) = new_region;
 
     isize first_block_storage_size = new_region->end - new_region->begin;
     Block *first_block = REGION_FIRST_BLOCK(new_region);
@@ -382,7 +391,11 @@ static void region_list_remove(RegionList *list, Region *region) {
 struct HeapAllocator {
     RegionList regions;
 
-    // Sentinel elements representing circular linked lists.
+    // The last region which got emptied. Free block inside is not tracked by any of the free lists.
+    // Keep it around just in case the next memory request will need a new region.
+    Region *cached_free_region;
+
+    // Circular linked lists represented with sentinel head elements.
     // "free_blocks[N].next" points to the first list element, ".previous" points to the last one.
     ListNode free_blocks[64];
     u64 free_blocks_availability;
@@ -569,10 +582,14 @@ static Block *heap_allocator_grow_last_block(
     if (heap_grow_result == NULL) {
         return NULL;
     }
-    region->end = region->end + region_increment;
-    REGION_GUARD_BLOCK(region)->storage_size = (usize)GUARD_BLOCK_STORAGE_SIZE;
-    block_set_size(block, region->end - (u8 *)BLOCK_MEMORY(block));
 
+    region->end = region->end + region_increment;
+
+    Block *guard_block = REGION_GUARD_BLOCK(region);
+    guard_block->storage_size = (usize)0;
+    REGION_FROM_GUARD_BLOCK(guard_block) = region;
+
+    block_set_size(block, region->end - (u8 *)BLOCK_MEMORY(block));
     return block;
 }
 
@@ -652,6 +669,23 @@ void *heap_allocate(HeapAllocator *allocator, isize size) {
         return BLOCK_MEMORY(last_block);
     }
 
+    // Try to use a cached free region.
+
+    if (allocator->cached_free_region != NULL) {
+        Block *cached_block = REGION_FIRST_BLOCK(allocator->cached_free_region);
+        if (size < BLOCK_SIZE(cached_block)) {
+            allocator->cached_free_region = NULL;
+
+            Block *remainder_block = block_split(cached_block, size);
+            if (remainder_block != NULL) {
+                heap_allocator_free_list_add(allocator, remainder_block);
+            }
+
+            block_mark_as_in_use(cached_block);
+            return BLOCK_MEMORY(cached_block);
+        }
+    }
+
     // Allocate a new region otherwise.
 
     Region *new_region = region_create_for_memory_request(
@@ -685,36 +719,46 @@ void heap_deallocate(HeapAllocator *allocator, void *memory) {
         Region *region = (Region *)((u8 *)block - REGION_HEADER_SIZE);
         region_list_remove(&allocator->regions, region);
         allocator->system_deallocate(allocator->user_context, region);
-
         return;
-    }
-
-    Block *previous_block = NULL;
-    if (BLOCK_PREVIOUS_IS_FREE(block)) {
-        previous_block = BLOCK_PREVIOUS(block);
-    }
-
-    Block *next_block = NULL;
-    if (BLOCK_IS_FREE(BLOCK_NEXT(block))) {
-        next_block = BLOCK_NEXT(block);
     }
 
     Block *merged_block = block;
     isize merged_block_size = BLOCK_SIZE(block);
 
-    if (previous_block != NULL) {
+    if (BLOCK_PREVIOUS_IS_FREE(block)) {
+        Block *previous_block = BLOCK_PREVIOUS(block);
         merged_block = previous_block;
         merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(previous_block);
         heap_allocator_free_list_remove(allocator, previous_block);
     }
 
-    if (next_block != NULL) {
+    if (BLOCK_IS_FREE(BLOCK_NEXT(block))) {
+        Block *next_block = BLOCK_NEXT(block);
         merged_block_size += BLOCK_HEADER_SIZE + BLOCK_SIZE(next_block);
         heap_allocator_free_list_remove(allocator, next_block);
     }
 
     block_set_size(merged_block, merged_block_size);
     block_mark_as_free(merged_block);
+
+    // Check if the (free) block we ended up with spans the entire region.
+    if (allocator->system_deallocate != NULL && IS_GUARD_BLOCK(BLOCK_NEXT(merged_block))) {
+        Block *guard_block = BLOCK_NEXT(merged_block);
+        Region *region = REGION_FROM_GUARD_BLOCK(guard_block);
+
+        if (REGION_FIRST_BLOCK(region) == merged_block) {
+            Region *old_cached_region = allocator->cached_free_region;
+            allocator->cached_free_region = region;
+
+            if (old_cached_region != NULL) {
+                region_list_remove(&allocator->regions, old_cached_region);
+                allocator->system_deallocate(allocator->user_context, old_cached_region);
+            }
+
+            return;
+        }
+    }
+
     heap_allocator_free_list_add(allocator, merged_block);
 }
 
