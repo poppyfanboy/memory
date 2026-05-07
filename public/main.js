@@ -51,6 +51,10 @@ class HeapAllocator {
         return this.instance.exports.heap_allocate(this.address, size);
     }
 
+    deallocate(memoryAddress) {
+        this.instance.exports.heap_deallocate(this.address, memoryAddress);
+    }
+
     blocks() {
         return new HeapIterator(this);
     }
@@ -92,6 +96,16 @@ class BlockList {
         this.allocator = allocator;
         this.root = root;
 
+        this.root.addEventListener('click', (event) => {
+            const deleteButton = event.target.closest('button');
+
+            if (deleteButton != null && deleteButton.dataset.address != null) {
+                const memoryAddress = Number.parseInt(deleteButton.dataset.address);
+                this.allocator.deallocate(memoryAddress);
+                this.refresh();
+            }
+        });
+
         this.refresh();
     }
 
@@ -100,34 +114,48 @@ class BlockList {
             this.root.firstChild.remove();
         }
 
-        const nodeTemplate = document.getElementById('block-list-node-template');
+        const listElementTemplate = document.getElementById('block-list-element-template');
 
         for (const block of this.allocator.blocks()) {
-            const nodeRoot = document.importNode(nodeTemplate.content, true);
-            const node = nodeRoot.querySelector('.block-list__node');
+            const listElementNode = document.importNode(listElementTemplate.content, true);
 
-            const addressFormatted = `0x${block.memory.toString(16).padStart(8, '0')}`;
-            const sizeFormatted = block.size.toString().padStart(9);
-            const blockDescription = block.memory == this.allocator.address
+            const addressElement = listElementNode.querySelector('.block-list-element__address');
+            const labelElement = listElementNode.querySelector('.block-list-element__label');
+            const sizeElement = listElementNode.querySelector('.block-list-element__size');
+
+            addressElement.textContent = `0x${block.memory.toString(16).padStart(8, '0')}`;
+            sizeElement.textContent = `Size: ${block.size} B`;
+            labelElement.textContent = block.memory == this.allocator.address
                 ? 'Allocator metadata'
                 : `${block.isFree ? 'Free' : 'Occupied'} block`;
 
-            node.textContent = `[${addressFormatted}] ${sizeFormatted} bytes: ${blockDescription}`;
-            this.root.appendChild(nodeRoot);
+            if (block.memory == this.allocator.address || block.isFree) {
+                const listElement = listElementNode.querySelector('.block-list-element');
+                listElement.classList.add('block-list-element--disabled');
+            }
+
+            const deleteButton = listElementNode.querySelector(
+                '.block-list-element__delete-button'
+            );
+            deleteButton.dataset.address = block.memory.toString();
+
+            this.root.appendChild(listElementNode);
         }
     }
 }
 
-let theme = 'light';
 const themeButton = document.getElementById('theme-button');
 
 themeButton.addEventListener('click', () => {
+    let theme = document.documentElement.dataset.theme ?? 'light';
+
     if (theme == 'light') {
         theme = 'dark';
     } else {
         theme = 'light';
     }
 
+    localStorage.setItem('theme', theme);
     document.documentElement.dataset.theme = theme;
 });
 
